@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import json
 import math
 import random
@@ -472,6 +473,13 @@ def final_optimizer_state_for_train_args(args: argparse.Namespace) -> Path:
     return Path(args.output_dir) / f"{prediction_type}pred-train-state.pt"
 
 
+def release_cuda_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
 def should_run_train_sample(args: argparse.Namespace, global_step: int) -> bool:
     every = getattr(args, "sample_every_steps", 0) or 0
     total_step = getattr(args, "global_step_offset", 0) + global_step
@@ -552,6 +560,8 @@ def sample_from_training_student(
             if args.sample_wandb_log_images:
                 log_sample_images_to_wandb(wandb_run, image_paths, args.sample_prompt, step=total_step)
     print(f"saved training sample latent tensor to {latent_path}")
+    del x_latent, sigmas, eps_latent
+    release_cuda_memory()
     return image_paths
 
 
@@ -621,35 +631,40 @@ def build_cache(args: argparse.Namespace) -> None:
             written += 1
             progress.update(1)
             progress.set_postfix(written=written, skipped=skipped)
+        del eps_latent, x_teacher_latent, text_conditioning
 
-    pending_by_size: dict[tuple[int, int], list[tuple[int, str, Path]]] = {}
-    for sample_index, prompt in selected:
-        if getattr(args, "bucket_enabled", False):
-            width, height = choose_cache_bucket(sample_index, args.seed)
-        else:
-            width, height = args.width, args.height
-        path = bucket_cache_path(
-            cache_dir,
-            sample_index,
-            width=width,
-            height=height,
-            bucket_enabled=bool(getattr(args, "bucket_enabled", False)),
-        )
-        if args.skip_existing and path.exists():
-            skipped += 1
-            progress.update(1)
-            progress.set_postfix(written=written, skipped=skipped)
-            continue
-        pending = pending_by_size.setdefault((width, height), [])
-        pending.append((sample_index, prompt, path))
-        if len(pending) >= args.cache_batch_size:
-            write_batch(width, height, pending)
-            pending.clear()
-    for (width, height), pending in pending_by_size.items():
-        if pending:
-            write_batch(width, height, pending)
-    progress.close()
-    print(f"wrote {written} x-pred cache sample(s) to {cache_dir}; skipped {skipped} existing sample(s)")
+    try:
+        pending_by_size: dict[tuple[int, int], list[tuple[int, str, Path]]] = {}
+        for sample_index, prompt in selected:
+            if getattr(args, "bucket_enabled", False):
+                width, height = choose_cache_bucket(sample_index, args.seed)
+            else:
+                width, height = args.width, args.height
+            path = bucket_cache_path(
+                cache_dir,
+                sample_index,
+                width=width,
+                height=height,
+                bucket_enabled=bool(getattr(args, "bucket_enabled", False)),
+            )
+            if args.skip_existing and path.exists():
+                skipped += 1
+                progress.update(1)
+                progress.set_postfix(written=written, skipped=skipped)
+                continue
+            pending = pending_by_size.setdefault((width, height), [])
+            pending.append((sample_index, prompt, path))
+            if len(pending) >= args.cache_batch_size:
+                write_batch(width, height, pending)
+                pending.clear()
+        for (width, height), pending in pending_by_size.items():
+            if pending:
+                write_batch(width, height, pending)
+        print(f"wrote {written} x-pred cache sample(s) to {cache_dir}; skipped {skipped} existing sample(s)")
+    finally:
+        progress.close()
+        del adapter, sigmas
+        release_cuda_memory()
 
 
 def chunked_rum(args: argparse.Namespace) -> None:
@@ -704,6 +719,7 @@ def chunked_rum(args: argparse.Namespace) -> None:
         update_chunk_manifest(manifest_path, plan, status="building_cache", cache_dir=str(chunk_cache_dir))
         print(f"{chunk_name}: building cache start_index={plan.start_index} num_samples={plan.num_samples}")
         build_cache(cache_args)
+        release_cuda_memory()
         update_chunk_manifest(manifest_path, plan, status="cache_built", cache_dir=str(chunk_cache_dir))
 
         train_args = make_stage_args(args.config, "train_xpred")
@@ -722,7 +738,10 @@ def chunked_rum(args: argparse.Namespace) -> None:
             f"student_init={train_args.student_init or '<default>'} "
             f"optimizer_state={train_args.optimizer_state or '<none>'}"
         )
-        train_xpred(train_args)
+        try:
+            train_xpred(train_args)
+        finally:
+            release_cuda_memory()
 
         checkpoint = final_checkpoint_for_train_args(train_args)
         if not checkpoint.exists():
@@ -925,6 +944,10 @@ def train_xpred(args: argparse.Namespace) -> None:
     args.optimizer_state_output = str(train_state_path)
     print(f"saved {args.prediction_type}-pred checkpoint to {checkpoint_path}")
     print(f"saved optimizer state to {train_state_path}")
+    del student, optimizer, batch_cursor
+    if not args.toy_smoke:
+        del adapter
+    release_cuda_memory()
 
 
 def sample_xpred(args: argparse.Namespace) -> None:
@@ -976,6 +999,12 @@ def sample_xpred(args: argparse.Namespace) -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+    del eps_latent, sigmas, x_latent
+    if "student" in locals():
+        del student
+    if adapter is not None:
+        del adapter
+    release_cuda_memory()
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:

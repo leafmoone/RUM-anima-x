@@ -12,6 +12,7 @@ sentencepiece
 toml
 torch
 tqdm
-transformers
+transformers>=4.48.3,<5
+peft>=0.14.0,<0.18
 voluptuous
 wandb
