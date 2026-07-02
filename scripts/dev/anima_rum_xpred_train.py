@@ -373,6 +373,10 @@ def resolve_chunk_student_init(args: argparse.Namespace, previous_checkpoint: st
     return previous_checkpoint or args.student_init
 
 
+def resolve_chunk_optimizer_state(args: argparse.Namespace, previous_optimizer_state: str | None) -> str | None:
+    return previous_optimizer_state or getattr(args, "optimizer_state", None)
+
+
 def make_stage_args(config_path: str, command: str) -> argparse.Namespace:
     args = config_to_namespace(load_toml_config(config_path), command_override=command)
     args.config = str(Path(config_path).resolve())
@@ -389,6 +393,11 @@ def final_checkpoint_for_train_args(args: argparse.Namespace) -> Path:
     return Path(args.output_dir) / (
         "xpred-adapter-checkpoint.safetensors" if prediction_type == "x" else "vpred-adapter-checkpoint.safetensors"
     )
+
+
+def final_optimizer_state_for_train_args(args: argparse.Namespace) -> Path:
+    prediction_type = getattr(args, "prediction_type", "x")
+    return Path(args.output_dir) / f"{prediction_type}pred-train-state.pt"
 
 
 def should_run_train_sample(args: argparse.Namespace, global_step: int) -> bool:
@@ -566,6 +575,7 @@ def chunked_rum(args: argparse.Namespace) -> None:
     manifest = load_chunk_manifest(manifest_path)
     completed = completed_chunk_ids(manifest) if args.resume else set()
     previous_checkpoint = None
+    previous_optimizer_state = None
     manifest_by_chunk_id = {
         int(chunk["chunk_id"]): chunk
         for chunk in manifest.get("chunks", [])
@@ -589,6 +599,9 @@ def chunked_rum(args: argparse.Namespace) -> None:
             checkpoint = completed_chunk.get("checkpoint")
             if checkpoint:
                 previous_checkpoint = str(checkpoint)
+            optimizer_state = completed_chunk.get("optimizer_state")
+            if optimizer_state:
+                previous_optimizer_state = str(optimizer_state)
             global_step_offset += chunk_train_steps(completed_chunk, chunk_output_dir)
             continue
 
@@ -605,6 +618,7 @@ def chunked_rum(args: argparse.Namespace) -> None:
         train_args.cache_dir = str(chunk_cache_dir)
         train_args.output_dir = str(chunk_output_dir)
         train_args.student_init = resolve_chunk_student_init(args, previous_checkpoint)
+        train_args.optimizer_state = resolve_chunk_optimizer_state(args, previous_optimizer_state)
         train_args.global_step_offset = global_step_offset
         if train_args.lr_scheduler_total_steps is None:
             train_args.lr_scheduler_total_steps = planned_total_train_steps
@@ -613,7 +627,8 @@ def chunked_rum(args: argparse.Namespace) -> None:
         update_chunk_manifest(manifest_path, plan, status="training", output_dir=str(chunk_output_dir))
         print(
             f"{chunk_name}: training cache_dir={chunk_cache_dir} "
-            f"student_init={train_args.student_init or '<default>'}"
+            f"student_init={train_args.student_init or '<default>'} "
+            f"optimizer_state={train_args.optimizer_state or '<none>'}"
         )
         train_xpred(train_args)
 
@@ -621,12 +636,17 @@ def chunked_rum(args: argparse.Namespace) -> None:
         if not checkpoint.exists():
             raise FileNotFoundError(f"expected chunk checkpoint was not written: {checkpoint}")
         previous_checkpoint = str(checkpoint)
+        optimizer_state = final_optimizer_state_for_train_args(train_args)
+        if not optimizer_state.exists():
+            raise FileNotFoundError(f"expected chunk optimizer state was not written: {optimizer_state}")
+        previous_optimizer_state = str(optimizer_state)
         update_chunk_manifest(
             manifest_path,
             plan,
             status="complete",
             output_dir=str(chunk_output_dir),
             checkpoint=str(checkpoint),
+            optimizer_state=str(optimizer_state),
             train_steps=getattr(train_args, "completed_train_steps", None) or getattr(train_args, "resolved_max_train_steps", None),
         )
         global_step_offset += getattr(train_args, "completed_train_steps", 0) or getattr(train_args, "resolved_max_train_steps", 0)
@@ -661,6 +681,15 @@ def train_xpred(args: argparse.Namespace) -> None:
         eps=args.adam_epsilon,
         weight_decay=args.weight_decay,
     )
+    optimizer_state_path = getattr(args, "optimizer_state", None)
+    if optimizer_state_path:
+        state_path = Path(optimizer_state_path)
+        if state_path.exists():
+            state = torch.load(state_path, map_location=device)
+            optimizer.load_state_dict(state["optimizer"])
+            print(f"loaded optimizer state from {state_path}")
+        else:
+            print(f"optimizer_state was set but not found, starting optimizer fresh: {state_path}")
     generator = torch.Generator(device=device).manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -772,20 +801,36 @@ def train_xpred(args: argparse.Namespace) -> None:
         torch.save({"state_dict": student.state_dict(), "args": serializable_args(args), "losses": losses}, checkpoint_path)
     else:
         adapter.save_student_xpred(student, checkpoint_path)
-        (output_dir / "train-summary.json").write_text(
-            json.dumps(
-                {
-                    "losses": losses,
-                    "prediction_type": args.prediction_type,
-                    "global_step_offset": getattr(args, "global_step_offset", 0),
-                    "completed_train_steps": completed_train_steps,
-                    "total_completed_steps": getattr(args, "global_step_offset", 0) + completed_train_steps,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+    train_state_path = final_optimizer_state_for_train_args(args)
+    torch.save(
+        {
+            "optimizer": optimizer.state_dict(),
+            "args": serializable_args(args),
+            "prediction_type": args.prediction_type,
+            "global_step_offset": getattr(args, "global_step_offset", 0),
+            "completed_train_steps": completed_train_steps,
+            "total_completed_steps": getattr(args, "global_step_offset", 0) + completed_train_steps,
+        },
+        train_state_path,
+    )
+    (output_dir / "train-summary.json").write_text(
+        json.dumps(
+            {
+                "losses": losses,
+                "prediction_type": args.prediction_type,
+                "global_step_offset": getattr(args, "global_step_offset", 0),
+                "completed_train_steps": completed_train_steps,
+                "total_completed_steps": getattr(args, "global_step_offset", 0) + completed_train_steps,
+                "optimizer_state": str(train_state_path),
+            },
+            indent=2,
         )
+        + "\n",
+        encoding="utf-8",
+    )
+    args.optimizer_state_output = str(train_state_path)
     print(f"saved {args.prediction_type}-pred checkpoint to {checkpoint_path}")
+    print(f"saved optimizer state to {train_state_path}")
 
 
 def sample_xpred(args: argparse.Namespace) -> None:
@@ -908,6 +953,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--output_dir")
     train.add_argument("--prediction_type", default="x", choices=["x", "v"])
     train.add_argument("--global_step_offset", type=int, default=0, help=argparse.SUPPRESS)
+    train.add_argument("--optimizer_state", default=None, help="Optional optimizer state checkpoint to resume AdamW moments.")
     train.add_argument("--max_train_steps", type=int, default=None)
     train.add_argument("--num_train_epochs", type=float, default=1.0)
     train.add_argument("--train_batch_size", type=int, default=1)

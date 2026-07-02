@@ -42,10 +42,10 @@ Training-time sample previews are supported but disabled by default. Set `[train
 `chunked_rum` automates the original RUM-style loop for large runs:
 
 ```text
-build cache chunk N -> train on chunk N -> use checkpoint N for chunk N+1 -> repeat
+build cache chunk N -> train on chunk N -> use checkpoint/state N for chunk N+1 -> repeat
 ```
 
-It writes chunk caches under `[chunked_rum].chunk_root/cache/`, chunk checkpoints under `[chunked_rum].chunk_root/train/`, and resume state to `chunk-manifest.json`. This is sequential on one GPU; it does not run teacher cache generation in parallel with student training.
+It writes chunk caches under `[chunked_rum].chunk_root/cache/`, chunk checkpoints and optimizer states under `[chunked_rum].chunk_root/train/`, and resume state to `chunk-manifest.json`. Each next chunk inherits both the previous student checkpoint and AdamW optimizer state. This is sequential on one GPU; it does not run teacher cache generation in parallel with student training.
 
 ## Toy Smoke
 

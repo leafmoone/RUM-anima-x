@@ -129,7 +129,7 @@ The loop is:
 cache chunk-0000 -> train chunk-0000 -> cache chunk-0001 -> train chunk-0001 -> ...
 ```
 
-Each next chunk uses the previous chunk's final checkpoint as `student_init`. Resume is controlled by:
+Each next chunk uses the previous chunk's final student checkpoint as `student_init` and loads the previous AdamW state from `<prediction_type>pred-train-state.pt`. This preserves optimizer moments across chunk boundaries instead of restarting AdamW each chunk. Resume is controlled by:
 
 ```toml
 [chunked_rum]
@@ -145,6 +145,15 @@ Progress is recorded in:
 ```text
 <chunk_root>/chunk-manifest.json
 ```
+
+The manifest records both:
+
+```text
+checkpoint       # xpred-adapter-checkpoint.safetensors or vpred-adapter-checkpoint.safetensors
+optimizer_state  # xpred-train-state.pt or vpred-train-state.pt
+```
+
+On resume, completed chunks are skipped and their checkpoint/state paths are used for the next incomplete chunk. An incomplete `training` chunk is still restarted from the previous completed chunk; in-chunk dataloader position and partial optimizer steps are not restored.
 
 Set `delete_cache_after_train = true` only when you want to save disk and are comfortable rebuilding a chunk if you need to rerun it. On a single GPU this is sequential, not parallel prefetching.
 

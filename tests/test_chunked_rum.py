@@ -4,9 +4,11 @@ from scripts.dev.anima_rum_xpred_train import (
     ChunkPlan,
     chunk_train_steps,
     completed_chunk_ids,
+    final_optimizer_state_for_train_args,
     lr_scale_for_step,
     make_chunk_plan,
     planned_chunk_train_steps,
+    resolve_chunk_optimizer_state,
     resolve_chunk_student_init,
     should_run_train_sample,
 )
@@ -49,6 +51,21 @@ def test_resolve_chunk_student_init_uses_previous_checkpoint_after_first_chunk()
 
     assert resolve_chunk_student_init(args, previous_checkpoint=None) == "/models/teacher.safetensors"
     assert resolve_chunk_student_init(args, previous_checkpoint="/tmp/chunk-0000/xpred.safetensors") == "/tmp/chunk-0000/xpred.safetensors"
+
+
+def test_resolve_chunk_optimizer_state_uses_previous_state_after_first_chunk():
+    args = argparse.Namespace(optimizer_state=None)
+
+    assert resolve_chunk_optimizer_state(args, previous_optimizer_state=None) is None
+    assert resolve_chunk_optimizer_state(args, previous_optimizer_state="/tmp/chunk-0000/train-state.pt") == "/tmp/chunk-0000/train-state.pt"
+
+
+def test_final_optimizer_state_path_uses_prediction_type(tmp_path):
+    x_args = argparse.Namespace(output_dir=str(tmp_path), prediction_type="x")
+    v_args = argparse.Namespace(output_dir=str(tmp_path), prediction_type="v")
+
+    assert final_optimizer_state_for_train_args(x_args) == tmp_path / "xpred-train-state.pt"
+    assert final_optimizer_state_for_train_args(v_args) == tmp_path / "vpred-train-state.pt"
 
 
 def test_chunk_train_steps_prefers_manifest_then_summary(tmp_path):

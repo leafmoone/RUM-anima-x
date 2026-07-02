@@ -57,6 +57,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "output_dir": None,
         "prediction_type": "x",
         "global_step_offset": 0,
+        "optimizer_state": None,
         "max_train_steps": None,
         "num_train_epochs": 1.0,
         "train_batch_size": 1,
