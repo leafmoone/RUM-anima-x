@@ -29,7 +29,9 @@ python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_x
 
 Without a subcommand, the script uses `command` from the config. With a subcommand, the subcommand selects the stage. The same config can contain `[build_cache]`, `[train_xpred]`, and `[sample_xpred]` sections.
 
-The example config includes the normal experiment controls: cache start index, cache batch size, skip-existing resume behavior, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, shuffle/drop-last, periodic checkpoints, gradient checkpointing, wandb logging, dry run, and sample count.
+The example config includes the normal experiment controls: cache start index, cache batch size, skip-existing resume behavior, optional built-in resolution bucketing, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, shuffle/drop-last, periodic checkpoints, gradient checkpointing, wandb logging, dry run, and sample count.
+
+Set `[build_cache].bucket_enabled = true` to use the built-in fixed resolution buckets. Cache files are written under `cache_dir/<width>x<height>/`; training discovers those subdirectories automatically and samples each optimizer micro-batch from one bucket so latent shapes do not mix inside a batch.
 
 Training is epoch-driven by default: omit `max_train_steps` and set `num_train_epochs`. The script computes optimizer steps from the number of cache samples and the effective batch size.
 

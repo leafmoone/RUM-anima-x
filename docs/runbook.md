@@ -115,6 +115,23 @@ teacher_lora_weight = 1.0
 
 Do not mix this cache directory with the older base 30-step cache. They are different teacher endpoint distributions.
 
+To enable automatic fixed resolution bucketing, set:
+
+```toml
+[build_cache]
+bucket_enabled = true
+```
+
+The concrete bucket list is fixed in code. You do not need to write resolutions into the config. Samples are assigned deterministically from `seed + sample_index` and saved as:
+
+```text
+<cache_dir>/1024x1024/sample-000000.safetensors
+<cache_dir>/832x1216/sample-000001.safetensors
+...
+```
+
+`train_xpred` and `chunked_rum` discover these bucket subdirectories automatically. Each optimizer micro-batch is read from a single bucket, so different latent shapes are never concatenated in one batch.
+
 ## 5. Rolling Chunked RUM
 
 For large runs where you do not want to cache everything before training, use:

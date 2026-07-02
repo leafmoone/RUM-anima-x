@@ -2,8 +2,8 @@ import argparse
 
 import torch
 
-from anima_rum_xpred import CacheMetadata, save_xpred_cache_sample
-from scripts.dev.anima_rum_xpred_train import final_optimizer_state_for_train_args, resolve_max_train_steps, train_xpred
+from anima_rum_xpred import CacheMetadata, load_xpred_cache_sample, save_xpred_cache_sample
+from scripts.dev.anima_rum_xpred_train import build_cache, final_optimizer_state_for_train_args, resolve_max_train_steps, train_xpred
 
 
 def test_resolve_max_train_steps_from_epochs():
@@ -101,3 +101,38 @@ def test_train_xpred_saves_and_loads_optimizer_state(tmp_path):
 
     assert second_state["completed_train_steps"] == 1
     assert second_state["optimizer"]["state"]
+
+
+def test_build_cache_bucket_enabled_writes_resolution_subdirs(tmp_path):
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("\n".join([f"prompt {index}" for index in range(10)]), encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    args = argparse.Namespace(
+        device="cpu",
+        mixed_precision="fp32",
+        prompts=str(prompts),
+        cache_dir=str(cache_dir),
+        num_samples=10,
+        start_index=0,
+        cache_batch_size=2,
+        skip_existing=True,
+        bucket_enabled=True,
+        width=64,
+        height=64,
+        teacher_steps=1,
+        flow_shift=3.0,
+        teacher_cfg=1.0,
+        teacher_lora=None,
+        teacher_lora_weight=1.0,
+        seed=11,
+        toy_smoke=True,
+        adapter="",
+    )
+
+    build_cache(args)
+
+    files = sorted(cache_dir.glob("*/*.safetensors"))
+    assert len(files) == 10
+    assert len({path.parent.name for path in files}) > 1
+    sample = load_xpred_cache_sample(files[0], device="cpu", dtype=torch.float32)
+    assert f"{sample['width']}x{sample['height']}" == files[0].parent.name

@@ -1,10 +1,15 @@
 import argparse
 
 from scripts.dev.anima_rum_xpred_train import (
+    DEFAULT_CACHE_BUCKETS,
+    CacheBucketBatchCursor,
     ChunkPlan,
     chunk_train_steps,
     completed_chunk_ids,
     final_optimizer_state_for_train_args,
+    bucket_cache_path,
+    choose_cache_bucket,
+    collect_cache_buckets,
     lr_scale_for_step,
     make_chunk_plan,
     planned_chunk_train_steps,
@@ -118,3 +123,51 @@ def test_lr_scale_can_use_total_step_across_chunks():
 
     assert first_step_in_later_chunk < 1.0
     assert restarted_chunk_step == 0.01
+
+
+def test_choose_cache_bucket_is_deterministic_and_uses_fixed_buckets():
+    bucket_a = choose_cache_bucket(sample_index=123, seed=7)
+    bucket_b = choose_cache_bucket(sample_index=123, seed=7)
+
+    assert bucket_a == bucket_b
+    assert bucket_a in DEFAULT_CACHE_BUCKETS
+
+
+def test_bucket_cache_path_puts_bucketed_samples_in_resolution_dirs(tmp_path):
+    flat = bucket_cache_path(tmp_path, 12, width=1024, height=1024, bucket_enabled=False)
+    bucketed = bucket_cache_path(tmp_path, 12, width=832, height=1216, bucket_enabled=True)
+
+    assert flat == tmp_path / "sample-000012.safetensors"
+    assert bucketed == tmp_path / "832x1216" / "sample-000012.safetensors"
+
+
+def test_collect_cache_buckets_separates_resolution_dirs(tmp_path):
+    root_file = tmp_path / "sample-000000.safetensors"
+    root_file.write_text("root", encoding="utf-8")
+    bucket_dir = tmp_path / "832x1216"
+    bucket_dir.mkdir()
+    bucket_file = bucket_dir / "sample-000001.safetensors"
+    bucket_file.write_text("bucket", encoding="utf-8")
+
+    buckets = collect_cache_buckets(tmp_path)
+
+    assert [bucket.name for bucket in buckets] == ["root", "832x1216"]
+    assert buckets[0].files == [root_file]
+    assert buckets[1].files == [bucket_file]
+
+
+def test_cache_bucket_cursor_returns_one_bucket_per_batch(tmp_path):
+    a = tmp_path / "1024x1024"
+    b = tmp_path / "832x1216"
+    a.mkdir()
+    b.mkdir()
+    for index in range(2):
+        (a / f"sample-{index:06d}.safetensors").write_text("a", encoding="utf-8")
+        (b / f"sample-{index + 2:06d}.safetensors").write_text("b", encoding="utf-8")
+    buckets = collect_cache_buckets(tmp_path)
+    cursor = CacheBucketBatchCursor(buckets, batch_size=2, shuffle=False, seed=1, drop_last=False)
+
+    batch = cursor.next()
+
+    assert len(batch) == 2
+    assert {path.parent.name for path in batch} in [{"1024x1024"}, {"832x1216"}]

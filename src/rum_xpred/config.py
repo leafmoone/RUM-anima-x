@@ -45,6 +45,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "start_index": 0,
         "cache_batch_size": 1,
         "skip_existing": True,
+        "bucket_enabled": False,
         "width": 1024,
         "height": 1024,
         "teacher_steps": 40,

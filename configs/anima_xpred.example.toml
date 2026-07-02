@@ -139,7 +139,12 @@ cache_batch_size = 28
 # true 时已有 sample-xxxxxx.safetensors 会跳过，便于断点续建 cache。
 skip_existing = true
 
+# true 时启用内置固定分辨率分桶；样本会按 seed/index 随机但确定地写入 cache_dir/宽x高/。
+# 具体 bucket 列表由代码固定，不需要在配置里手动指定。
+bucket_enabled = false
+
 # 生成 latent 对应的图像尺寸；必须能被 Anima/VAE latent scale 整除。
+# bucket_enabled=false 时使用这里的单一尺寸；bucket_enabled=true 时这里仅作为非分桶兼容默认值。
 width = 1024
 height = 1024
 

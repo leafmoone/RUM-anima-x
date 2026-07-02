@@ -42,6 +42,23 @@ from rum_xpred.anima import (
 from rum_xpred.config import config_to_namespace, load_toml_config
 
 
+DEFAULT_CACHE_BUCKETS: tuple[tuple[int, int], ...] = (
+    (1024, 1024),
+    (832, 1216),
+    (1216, 832),
+    (896, 1152),
+    (1152, 896),
+    (768, 1344),
+    (1344, 768),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class CacheBucket:
+    name: str
+    files: list[Path]
+
+
 @dataclasses.dataclass(frozen=True)
 class ChunkPlan:
     chunk_id: int
@@ -101,6 +118,37 @@ def make_seeded_eps_batch(
     return torch.cat(latents, dim=0)
 
 
+def choose_cache_bucket(sample_index: int, seed: int) -> tuple[int, int]:
+    rng = random.Random((int(seed) << 32) + int(sample_index))
+    return DEFAULT_CACHE_BUCKETS[rng.randrange(len(DEFAULT_CACHE_BUCKETS))]
+
+
+def bucket_name(width: int, height: int) -> str:
+    return f"{int(width)}x{int(height)}"
+
+
+def bucket_cache_path(cache_dir: Path, sample_index: int, *, width: int, height: int, bucket_enabled: bool) -> Path:
+    filename = f"sample-{sample_index:06d}.safetensors"
+    if not bucket_enabled:
+        return cache_dir / filename
+    return cache_dir / bucket_name(width, height) / filename
+
+
+def collect_cache_buckets(cache_dir: str | Path) -> list[CacheBucket]:
+    root = Path(cache_dir)
+    buckets: list[CacheBucket] = []
+    root_files = sorted(root.glob("*.safetensors"), key=cache_file_sort_key)
+    if root_files:
+        buckets.append(CacheBucket(name="root", files=root_files))
+    for child in sorted(root.iterdir() if root.exists() else [], key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        files = sorted(child.glob("*.safetensors"), key=cache_file_sort_key)
+        if files:
+            buckets.append(CacheBucket(name=child.name, files=files))
+    return buckets
+
+
 def merge_cache_samples(paths: list[Path], device: torch.device, dtype: torch.dtype) -> dict:
     samples = [load_xpred_cache_sample(path, device=device, dtype=dtype) for path in paths]
     shapes = {tuple(sample["x_teacher_latent"].shape[1:]) for sample in samples}
@@ -149,6 +197,30 @@ class CacheBatchCursor:
             if self.drop_last and selected:
                 selected = []
         return selected
+
+
+class CacheBucketBatchCursor:
+    def __init__(self, buckets: list[CacheBucket], batch_size: int, *, shuffle: bool, seed: int, drop_last: bool) -> None:
+        if not buckets:
+            raise ValueError("at least one cache bucket is required")
+        self.cursors = [
+            CacheBatchCursor(bucket.files, batch_size, shuffle=shuffle, seed=seed + index, drop_last=drop_last)
+            for index, bucket in enumerate(buckets)
+        ]
+        self.rng = random.Random(seed)
+        self.shuffle = shuffle
+        self.position = 0
+        self.order = list(range(len(self.cursors)))
+        if self.shuffle:
+            self.rng.shuffle(self.order)
+
+    def next(self) -> list[Path]:
+        if self.shuffle:
+            index = self.rng.randrange(len(self.cursors))
+            return self.cursors[index].next()
+        index = self.order[self.position]
+        self.position = (self.position + 1) % len(self.order)
+        return self.cursors[index].next()
 
 
 def prune_checkpoints(output_dir: Path, keep: int | None, *, prediction_type: str = "x") -> None:
@@ -500,23 +572,16 @@ def build_cache(args: argparse.Namespace) -> None:
     skipped = 0
     selected = [(args.start_index + offset, prompt) for offset, prompt in enumerate(prompts)]
     progress = tqdm(total=len(selected), desc="building x-pred cache", unit="sample")
-    for original_batch in chunked(selected, args.cache_batch_size):
-        batch = []
-        for item in original_batch:
-            if args.skip_existing and (cache_dir / f"sample-{item[0]:06d}.safetensors").exists():
-                skipped += 1
-                progress.update(1)
-            else:
-                batch.append(item)
-        if not batch:
-            continue
+
+    def write_batch(width: int, height: int, batch: list[tuple[int, str, Path]]) -> None:
+        nonlocal written
         sample_indices = [item[0] for item in batch]
         batch_prompts = [item[1] for item in batch]
         eps_latent = make_seeded_eps_batch(
             sample_indices,
             seed=args.seed,
-            height=args.height,
-            width=args.width,
+            height=height,
+            width=width,
             device=device,
             dtype=dtype,
         )
@@ -533,11 +598,11 @@ def build_cache(args: argparse.Namespace) -> None:
                 sigmas=sigmas,
                 guidance_scale=args.teacher_cfg,
             )
-        for batch_index, (sample_index, prompt) in enumerate(batch):
+        for batch_index, (sample_index, prompt, path) in enumerate(batch):
             metadata = CacheMetadata(
                 prompt=prompt,
-                width=args.width,
-                height=args.height,
+                width=width,
+                height=height,
                 seed=args.seed + sample_index,
                 sample_index=sample_index,
                 teacher_steps=args.teacher_steps,
@@ -547,7 +612,7 @@ def build_cache(args: argparse.Namespace) -> None:
                 teacher_lora_weight=getattr(args, "teacher_lora_weight", 1.0),
             )
             save_xpred_cache_sample(
-                cache_dir / f"sample-{sample_index:06d}.safetensors",
+                path,
                 x_teacher_latent[batch_index : batch_index + 1],
                 eps_latent[batch_index : batch_index + 1],
                 {key: value[batch_index : batch_index + 1] for key, value in text_conditioning.items()},
@@ -556,6 +621,33 @@ def build_cache(args: argparse.Namespace) -> None:
             written += 1
             progress.update(1)
             progress.set_postfix(written=written, skipped=skipped)
+
+    pending_by_size: dict[tuple[int, int], list[tuple[int, str, Path]]] = {}
+    for sample_index, prompt in selected:
+        if getattr(args, "bucket_enabled", False):
+            width, height = choose_cache_bucket(sample_index, args.seed)
+        else:
+            width, height = args.width, args.height
+        path = bucket_cache_path(
+            cache_dir,
+            sample_index,
+            width=width,
+            height=height,
+            bucket_enabled=bool(getattr(args, "bucket_enabled", False)),
+        )
+        if args.skip_existing and path.exists():
+            skipped += 1
+            progress.update(1)
+            progress.set_postfix(written=written, skipped=skipped)
+            continue
+        pending = pending_by_size.setdefault((width, height), [])
+        pending.append((sample_index, prompt, path))
+        if len(pending) >= args.cache_batch_size:
+            write_batch(width, height, pending)
+            pending.clear()
+    for (width, height), pending in pending_by_size.items():
+        if pending:
+            write_batch(width, height, pending)
     progress.close()
     print(f"wrote {written} x-pred cache sample(s) to {cache_dir}; skipped {skipped} existing sample(s)")
 
@@ -660,7 +752,8 @@ def chunked_rum(args: argparse.Namespace) -> None:
 def train_xpred(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     dtype = dtype_from_name(args.mixed_precision)
-    cache_files = sorted(Path(args.cache_dir).glob("*.safetensors"), key=cache_file_sort_key)
+    cache_buckets = collect_cache_buckets(args.cache_dir)
+    cache_files = [path for bucket in cache_buckets for path in bucket.files]
     if not cache_files:
         raise ValueError(f"no safetensors cache files found in {args.cache_dir}")
     adapter = None if args.toy_smoke else load_object(args.adapter)(args, device=device, dtype=dtype)
@@ -693,8 +786,8 @@ def train_xpred(args: argparse.Namespace) -> None:
     generator = torch.Generator(device=device).manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    batch_cursor = CacheBatchCursor(
-        cache_files,
+    batch_cursor = CacheBucketBatchCursor(
+        cache_buckets,
         args.train_batch_size,
         shuffle=args.shuffle_cache,
         seed=args.seed,
@@ -706,6 +799,7 @@ def train_xpred(args: argparse.Namespace) -> None:
         print(
             "auto max_train_steps="
             f"{resolved_max_train_steps} from cache_samples={len(cache_files)}, "
+            f"cache_buckets={len(cache_buckets)}, "
             f"effective_batch_size={args.train_batch_size * args.gradient_accumulation_steps}, "
             f"num_train_epochs={args.num_train_epochs}"
         )
@@ -939,6 +1033,7 @@ def parse_args() -> argparse.Namespace:
     cache.add_argument("--start_index", type=int, default=0)
     cache.add_argument("--cache_batch_size", type=int, default=1)
     cache.add_argument("--skip_existing", action="store_true", default=True)
+    cache.add_argument("--bucket_enabled", action="store_true", help="Randomly assign samples to built-in fixed resolution buckets.")
     cache.add_argument("--width", type=int, default=1024)
     cache.add_argument("--height", type=int, default=1024)
     cache.add_argument("--teacher_steps", type=int, default=DEFAULT_TEACHER_STEPS)

@@ -17,6 +17,7 @@ def test_config_to_namespace_merges_common_and_command_sections():
                 "cache_dir": "/tmp/cache",
                 "width": 64,
                 "height": 64,
+                "bucket_enabled": True,
                 "teacher_lora": "/models/turbo.safetensors",
                 "teacher_lora_weight": 0.75,
             },
@@ -29,6 +30,7 @@ def test_config_to_namespace_merges_common_and_command_sections():
     assert args.flow_shift == 2.0
     assert args.prompts == "data/prompts/sample_prompts.txt"
     assert args.cache_dir == "/tmp/cache"
+    assert args.bucket_enabled is True
     assert args.teacher_steps == 40
     assert args.teacher_lora == "/models/turbo.safetensors"
     assert args.teacher_lora_weight == 0.75
