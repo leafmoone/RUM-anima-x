@@ -1,0 +1,114 @@
+# Fast local smoke config. This does not load Anima weights.
+# 用法：
+#   python scripts/dev/anima_rum_xpred_train.py --config configs/toy_smoke.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py build_cache  --config configs/toy_smoke.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py train_xpred  --config configs/toy_smoke.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/toy_smoke.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/toy_smoke.example.toml
+command = "build_cache"
+
+[chunked_rum]
+chunk_root = "/tmp/rum-anima-xpred-chunk-smoke"
+total_samples = 2
+chunk_size = 1
+start_index = 0
+max_chunks = 2
+train_steps_per_chunk = 1
+delete_cache_after_train = false
+resume = true
+
+[common]
+device = "cpu"
+mixed_precision = "fp32"
+flow_shift = 3.0
+seed = 20260701
+toy_smoke = true
+adapter = "rum_xpred.adapters.anima_sd_scripts:create_adapter"
+dit = ""
+student_init = ""
+text_encoder = ""
+vae = ""
+vae_disable_cache = false
+negative_prompt = ""
+attn_mode = "torch"
+fp8 = false
+fp8_scaled = false
+text_encoder_cpu = false
+
+[wandb]
+wandb_enabled = false
+wandb_project = "rum-anima-xpred"
+wandb_entity = ""
+wandb_run_name = "toy-smoke"
+wandb_mode = "offline"
+wandb_tags = ["toy", "smoke"]
+wandb_notes = "Local toy smoke for config validation."
+wandb_log_config = true
+wandb_metrics_file = "/tmp/rum-anima-xpred-train-smoke/eval-metrics.json"
+wandb_metrics_log_every = 1
+
+[build_cache]
+prompts = "data/prompts/sample_prompts.txt"
+cache_dir = "/tmp/rum-anima-xpred-cache-smoke"
+num_samples = 2
+start_index = 0
+cache_batch_size = 2
+skip_existing = true
+width = 64
+height = 64
+teacher_steps = 4
+teacher_cfg = 1.0
+
+[train_xpred]
+cache_dir = "/tmp/rum-anima-xpred-cache-smoke"
+output_dir = "/tmp/rum-anima-xpred-train-smoke"
+num_train_epochs = 1.0
+# max_train_steps = 3
+train_batch_size = 2
+gradient_accumulation_steps = 2
+learning_rate = 1e-4
+lr_scheduler = "constant"
+lr_warmup_steps = 0
+lr_cosine_min = 0.1
+# lr_scheduler_total_steps = 100
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_epsilon = 1e-8
+max_grad_norm = 1.0
+sigma_min_train = 0.02
+shuffle_cache = true
+drop_last = false
+log_every = 1
+# save_every_steps = 1000
+# checkpoints_total_limit = 3
+gradient_checkpointing = false
+gradient_checkpointing_cpu_offload = false
+gradient_checkpointing_unsloth_offload = false
+sample_every_steps = 0
+sample_prompt = "toy smoke prompt"
+sample_steps = 4
+sample_num_samples = 1
+sample_eps_floor = 1e-4
+sample_width = 64
+sample_height = 64
+# sample_seed = 20260701
+# sample_output_dir = "/tmp/rum-anima-xpred-train-smoke/train-samples"
+sample_decode_images = false
+sample_image_prefix = "toy-train-sample"
+sample_wandb_log_images = true
+dry_run = false
+
+[sample_xpred]
+checkpoint = "/tmp/rum-anima-xpred-train-smoke/xpred-toy-smoke.pt"
+output = "/tmp/rum-anima-xpred-train-smoke/sample-latent.pt"
+prompt = "toy smoke prompt"
+num_samples = 2
+steps = 4
+width = 64
+height = 64
+eps_floor = 1e-4
+decode_sample_images = false
+sample_image_dir = "/tmp/rum-anima-xpred-train-smoke/sample-images"
+sample_image_prefix = "toy-sample"
+wandb_log_sample_images = true

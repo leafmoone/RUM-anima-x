@@ -1,0 +1,289 @@
+# RUM Anima latent x-pred experiment config.
+# 用法：
+#   python scripts/dev/anima_rum_xpred_train.py --config configs/anima_xpred.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py build_cache  --config configs/anima_xpred.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py train_xpred  --config configs/anima_xpred.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/anima_xpred.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
+#
+# 不写 subcommand 时执行下面的 command；写 subcommand 时以 CLI subcommand 为准。
+command = "chunked_rum"
+
+[chunked_rum]
+# 自动 RUM 流程：
+#   1. 按 chunk_size 从 prompts 里截取一段 prompt，构建该段 latent cache。
+#   2. 立即用这一段 cache 训练 x-pred student。
+#   3. 下一段训练会自动从上一段输出 checkpoint 初始化。
+#   4. chunk-manifest.json 记录状态；resume=true 时已 complete 的 chunk 会跳过。
+#
+# 执行方式：
+#   command = "chunked_rum"
+# 或：
+#   python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
+
+# rolling cache、分段训练输出和 manifest 的根目录。
+chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-turbo10-chunks"
+
+# 总共处理多少条 prompt。比如 30000 表示从 start_index 开始处理 30000 条。
+total_samples = 30000
+
+# 每次 cache 一段多少样本，然后用这一段训练。
+# 数值越大，cache 占盘越多；越小，切换 teacher/student 的频率越高。
+chunk_size = 3000
+
+# 第一段从 prompt 文件的哪个 index 开始。
+start_index = 0
+
+# 可选：只跑前 N 个 chunk，适合 smoke 或中断调试；删除表示一直跑完 total_samples。
+# max_chunks = 1
+
+# 可选：覆盖每个 chunk 的训练 optimizer step 数。
+# 删除时沿用 [train_xpred] 的 max_train_steps/num_train_epochs 自动逻辑。
+# train_steps_per_chunk = 250
+
+# true 时每个 chunk 训练完成后删除对应 cache，省磁盘。
+# 注意：删除后无法重新训练该 chunk，除非重新 build cache。
+delete_cache_after_train = true
+
+# true 时读取 chunk-manifest.json，跳过已 complete 的 chunk。
+resume = true
+
+[common]
+# 设备；留空或删除时会自动选择 cuda/cpu。
+# device = "cuda"
+
+# 计算精度：真实 Anima 默认 bf16；toy smoke 可用 fp32。
+mixed_precision = "bf16"
+
+# Anima shifted sigma 的 flow shift。训练采样、teacher schedule、sampler 必须一致。
+flow_shift = 3.0
+
+# 全流程随机种子。cache 阶段会按 sample index 自动递增。
+seed = 20260701
+
+# true 时使用本项目内置 toy model，不加载真实 Anima 权重。
+toy_smoke = false
+
+# 真实 Anima adapter。一般不需要改。
+adapter = "rum_xpred.adapters.anima_sd_scripts:create_adapter"
+
+# 真实 Anima DiT teacher checkpoint。
+dit = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+
+# student 初始化 checkpoint；留空时 train_xpred 默认从 dit 初始化。
+student_init = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+
+# Qwen3 text encoder。当前真实 adapter 必须提供。
+text_encoder = "/root/shared-nvme/anima/split_files/text_encoders/qwen_3_06b_base.safetensors"
+
+# Anima/Qwen VAE。当前 RUM 链路只缓存 latent；VAE 主要为后续 preview decode 预留。
+vae = "/root/shared-nvme/anima/split_files/vae/qwen_image_vae.safetensors"
+
+# VAE decode 分块设置。显存紧张时可设为 256/512；删除表示不分块。
+# vae_spatial_chunk_size = 512
+vae_disable_cache = false
+
+# negative prompt。teacher_cfg=1.0 时不会实际做双分支 CFG。
+negative_prompt = ""
+
+# 注意力实现：torch 最稳；安装对应依赖后可尝试 flash/sageattn/xformers。
+attn_mode = "flash"
+
+# 是否按 vendored Anima loader 的 FP8 路径加载。默认 false，先保证公式链路稳定。
+fp8 = false
+fp8_scaled = false
+
+# true 时 text encoder 保留在 CPU，显存压力小但更慢。
+text_encoder_cpu = false
+
+[wandb]
+# 默认关闭。打开后会记录 train/loss、train/grad_norm、train/lr 和有效 batch size。
+wandb_enabled = true
+
+# wandb 基础信息。wandb_mode 可设为 "offline" 做本地记录。
+wandb_project = "rum-anima-xpred"
+wandb_entity = ""
+wandb_run_name = "anima-xpred-rum"
+wandb_mode = ""
+wandb_tags = ["anima", "rum", "xpred"]
+wandb_notes = "Anima latent x-pred RUM reflow experiment."
+
+# true 时把当前 config/参数写入 wandb config。
+wandb_log_config = true
+
+# 可选：外部评估脚本写出的 JSON。训练循环会读取其中的 fid/is 并记录到 wandb。
+# 示例 JSON: {"fid": 12.3, "is": 5.6}
+# 当前项目训练本身只处理 latent，不会凭空计算 FID/IS。
+# wandb_metrics_file = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/eval-metrics.json"
+
+# 每隔多少 optimizer step 读取一次 wandb_metrics_file；0 表示不读取外部指标。
+wandb_metrics_log_every = 0
+
+[build_cache]
+# prompt 文件，一行一个 prompt。cache 阶段只保存 latent 和 text conditioning。
+prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
+
+# teacher endpoint cache 输出目录。turbo LoRA cache 不要和 base 30-step cache 混用。
+cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+
+# 只读取前 N 条 prompt；null 表示读取全部。
+num_samples = 30000
+
+# 从 prompt 文件的第几个样本开始，便于分块构建 cache。
+start_index = 0
+
+# cache 构建 batch size。真实 adapter 会把多个 prompt 的 embedding 拼 batch 后一次跑 teacher schedule。
+# 受 DiT + Qwen3 显存影响，建议从 1 或 2 开始试。
+cache_batch_size = 28
+
+# true 时已有 sample-xxxxxx.safetensors 会跳过，便于断点续建 cache。
+skip_existing = true
+
+# 生成 latent 对应的图像尺寸；必须能被 Anima/VAE latent scale 整除。
+width = 1024
+height = 1024
+
+# teacher 从 eps_latent 完整采样到 sigma=0 的步数。
+teacher_steps = 10
+
+# teacher CFG。默认 1.0，避免 teacher endpoint 已 guidance 后采样再二次 CFG。
+teacher_cfg = 1.0
+
+# 可选 teacher LoRA。这里使用 Anima Turbo LoRA 作为少步数 teacher 实验。
+teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
+
+# teacher LoRA 权重。
+teacher_lora_weight = 1.0
+
+[train_xpred]
+# build_cache 输出的 safetensors cache 目录。
+cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+
+# x-pred checkpoint 输出目录。
+output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train"
+
+# 训练 epoch 数。max_train_steps 未设置时，会按 cache 样本数和有效 batch 自动计算。
+num_train_epochs = 1.0
+
+# 显式 optimizer step 数；取消注释后会覆盖 num_train_epochs 自动计算。
+# max_train_steps = 7500
+
+# 每个 micro step 从 cache 读取多少样本。
+train_batch_size = 12
+
+# 梯度累积步数。有效 batch = train_batch_size * gradient_accumulation_steps。
+gradient_accumulation_steps = 4
+
+# 全量 DiT 转换默认小学习率。
+learning_rate = 5e-5
+
+# 学习率调度：constant 或 cosine。
+lr_scheduler = "cosine"
+
+# warmup optimizer steps。
+lr_warmup_steps = 1000
+
+# cosine 最低学习率比例，例如 0.1 表示最低到 learning_rate * 0.1。
+lr_cosine_min = 0.1
+
+# cosine 总步数；普通 train_xpred 未设置时使用本次训练步数。
+# chunked_rum 未设置时会自动估算所有 chunk 的总 optimizer step，避免每个块重置衰减。
+# lr_scheduler_total_steps = 100000
+
+# AdamW optimizer 参数。
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_epsilon = 1e-8
+
+# 梯度裁剪；0 表示不裁剪。
+max_grad_norm = 1.0
+
+# 训练 sigma 下界。太接近 0 时 sampler 的 (z - x) / sigma 会放大误差。
+sigma_min_train = 0.02
+
+# true 时训练按随机顺序循环 cache。
+shuffle_cache = true
+
+# true 时 cache 数量不足一个 batch 的尾部会丢弃并进入下一轮。
+drop_last = false
+
+# 每隔多少 step 打印 loss。
+log_every = 1
+
+# 周期保存 checkpoint；删除或注释表示只保存最终 checkpoint。
+save_every_steps = 1000
+
+# 周期 checkpoint 保留数量；删除或注释表示不自动删除旧 checkpoint。
+checkpoints_total_limit = 20
+
+# Anima DiT 训练梯度检查点。省显存但会变慢。
+gradient_checkpointing = true
+
+# CPU offload 更省显存但明显更慢；先保持 false。
+gradient_checkpointing_cpu_offload = false
+
+# Anima block 支持的 unsloth offload 路径；实验参数，默认 false。
+gradient_checkpointing_unsloth_offload = false
+
+# 训练中自动 sample。0 表示关闭；例如 1000 表示每 1000 个 optimizer step 采样一次。
+sample_every_steps = 50
+
+# 训练中 sample 使用的 prompt。真实 Anima sample 必须设置；toy smoke 可为空。
+sample_prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
+
+# 训练中 sample 的步数、数量、尺寸。sample_width/height 删除或注释时默认使用训练尺寸。
+sample_steps = 10
+sample_num_samples = 2
+sample_eps_floor = 1e-4
+# sample_width = 1024
+# sample_height = 1024
+
+# 训练中 sample seed；删除或注释时使用 [common].seed。
+# sample_seed = 20260701
+
+# 训练中 sample 输出目录；删除或留空时写到 output_dir/train-samples。
+# sample_output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/train-samples"
+
+# true 时训练中 sample 会用 VAE decode PNG；wandb_enabled=true 时可同步记录到 wandb sample/images。
+sample_decode_images = true
+sample_image_prefix = "xpred-train-sample"
+sample_wandb_log_images = true
+
+# true 时只跑一个 optimizer step、打印统计，不保存 checkpoint。
+dry_run = false
+
+[sample_xpred]
+# train_xpred 输出的 x-pred checkpoint。不能用旧 FM sampler 加载这个文件采样。
+checkpoint = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/xpred-adapter-checkpoint.safetensors"
+
+# 当前 sampler 输出 final latent tensor，不直接 decode 成图片。
+output = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/sample-latent.pt"
+
+# 专用 x-pred sampler 的 prompt。
+prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
+
+# 一次采样几个 latent，使用同一个 prompt、不同 seed offset。
+num_samples = 2
+
+# x-pred Euler 采样步数。
+steps = 10
+
+# 采样尺寸，需与目标 latent shape 对应。
+width = 1024
+height = 1024
+
+# v=(z-x)/sigma 的分母保护；terminal sigma=0 不会前向。
+eps_floor = 1e-4
+
+# true 时用 Anima/Qwen VAE 把 sampled latent 解码成 PNG。
+decode_sample_images = true
+
+# 解码图片输出目录；删除或留空时使用 output 去掉后缀后的同名目录。
+sample_image_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/sample-images"
+
+# PNG 文件名前缀。
+sample_image_prefix = "xpred-sample"
+
+# wandb_enabled=true 且 decode_sample_images=true 时，将 PNG 作为 wandb.Image 记录到 sample/images。
+wandb_log_sample_images = true

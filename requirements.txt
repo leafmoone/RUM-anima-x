@@ -1,0 +1,17 @@
+accelerate
+diffusers[torch]
+einops
+ftfy
+huggingface-hub
+imagesize
+numpy
+pillow
+rich
+safetensors
+sentencepiece
+toml
+torch
+tqdm
+transformers
+voluptuous
+wandb

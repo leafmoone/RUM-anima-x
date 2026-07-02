@@ -1,0 +1,102 @@
+# Anima velocity-prediction RUM reflow example.
+# 这个示例只切换 student 训练/采样解释方式，不改变 build_cache 的数据结构。
+# 当前 x-pred 主配置仍然使用 configs/anima_xpred.example.toml。
+
+command = "train_xpred"
+
+[common]
+mixed_precision = "bf16"
+flow_shift = 3.0
+seed = 20260701
+toy_smoke = false
+adapter = "rum_xpred.adapters.anima_sd_scripts:create_adapter"
+dit = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+student_init = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+text_encoder = "/root/shared-nvme/anima/split_files/text_encoders/qwen_3_06b_base.safetensors"
+vae = "/root/shared-nvme/anima/split_files/vae/qwen_image_vae.safetensors"
+negative_prompt = ""
+attn_mode = "flash"
+fp8 = false
+fp8_scaled = false
+text_encoder_cpu = false
+vae_disable_cache = false
+
+[wandb]
+wandb_enabled = false
+wandb_project = "rum-anima-vpred"
+wandb_run_name = "anima-vpred-reflow"
+wandb_mode = "offline"
+wandb_tags = ["anima", "rum", "vpred"]
+wandb_log_config = true
+wandb_metrics_log_every = 0
+
+[build_cache]
+# v-pred reflow 使用同样的 cache：eps_latent + x_teacher_latent + text conditioning。
+prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
+cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+num_samples = 30000
+start_index = 0
+cache_batch_size = 64
+skip_existing = true
+width = 1024
+height = 1024
+teacher_steps = 10
+teacher_cfg = 1.0
+teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
+teacher_lora_weight = 1.0
+
+[train_xpred]
+# prediction_type="v" 表示训练 target_v = eps_latent - x_teacher_latent。
+prediction_type = "v"
+cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-vpred-reflow-train"
+num_train_epochs = 1.0
+train_batch_size = 4
+gradient_accumulation_steps = 1
+learning_rate = 5e-5
+lr_scheduler = "cosine"
+lr_warmup_steps = 1000
+lr_cosine_min = 0.1
+weight_decay = 0.0
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_epsilon = 1e-8
+max_grad_norm = 1.0
+sigma_min_train = 0.02
+shuffle_cache = true
+drop_last = false
+log_every = 1
+save_every_steps = 1000
+checkpoints_total_limit = 3
+gradient_checkpointing = true
+gradient_checkpointing_cpu_offload = false
+gradient_checkpointing_unsloth_offload = false
+sample_every_steps = 0
+sample_prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
+sample_steps = 10
+sample_num_samples = 2
+sample_eps_floor = 1e-4
+# sample_width = 1024
+# sample_height = 1024
+# sample_seed = 20260701
+# sample_output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-vpred-reflow-train/train-samples"
+sample_decode_images = false
+sample_image_prefix = "vpred-train-sample"
+sample_wandb_log_images = true
+dry_run = false
+
+[sample_xpred]
+# v-pred checkpoint 必须用 prediction_type="v" 采样。
+prediction_type = "v"
+checkpoint = "/root/shared-nvme/RUM-anima-xpred/anima-vpred-reflow-train/vpred-adapter-checkpoint.safetensors"
+output = "/root/shared-nvme/RUM-anima-xpred/anima-vpred-reflow-train/sample-latent.pt"
+prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
+num_samples = 2
+steps = 10
+width = 1024
+height = 1024
+eps_floor = 1e-4
+decode_sample_images = true
+sample_image_dir = "/root/shared-nvme/RUM-anima-xpred/anima-vpred-reflow-train/sample-images"
+sample_image_prefix = "vpred-sample"
+wandb_log_sample_images = true

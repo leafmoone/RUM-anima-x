@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rum-xpred"
+version = "0.1.0"
+description = "RUM latent x-pred experiments with vendored Anima sd-scripts backend."
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate",
+  "diffusers[torch]",
+  "einops",
+  "ftfy",
+  "huggingface-hub",
+  "imagesize",
+  "numpy",
+  "pillow",
+  "rich",
+  "torch",
+  "safetensors",
+  "sentencepiece",
+  "toml",
+  "tqdm",
+  "transformers",
+  "voluptuous",
+  "wandb",
+]
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["rum_xpred*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

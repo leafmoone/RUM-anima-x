@@ -1,0 +1,63 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs and experiment trackers
+logs/
+wandb/
+
+# Generated outputs
+outputs/
+tmp/
+backups/
+.tools/
+.comfy_sysdeps/
+
+# Large model/checkpoint artifacts
+model/
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.gguf
+
+# RUM / Anima generated cache and chunk outputs
+cache/
+cache_data/
+*-cache/
+*cache*/
+anima-xpred-chunks/
+anima-xpred-turbo10-chunks/
+chunk-manifest.json
+
+# Legacy QAT artifacts from the source workspace
+qat_cache*/
+qat_cached*/
+configs/generated_qat_chunks/
+
+# Local datasets or scratch assets
+image_balance_2024_webp/

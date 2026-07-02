@@ -1,0 +1,257 @@
+# Runbook
+
+All commands assume:
+
+```bash
+cd /root/shared-nvme/RUM-anima-xpred
+```
+
+## 1. Verify Install
+
+```bash
+python -c "import diffusers, transformers, accelerate, safetensors; print('deps ok')"
+PYTHONPATH=src python -c "from rum_xpred.adapters.anima_sd_scripts import create_adapter; print('adapter ok')"
+pytest -q
+```
+
+## 2. Prepare Config
+
+Use `configs/anima_xpred.example.toml` as the main editable config. It contains every normal option for all three stages:
+
+- `[common]`: shared device, precision, Anima model paths, adapter, seed, attention mode, and FP8/text-encoder placement flags.
+- `[wandb]`: optional wandb logging settings. It is disabled by default; set `wandb_enabled = true` and use `wandb_mode = "offline"` for local-only logging. `train/grad_norm` is logged directly by the trainer; FID/IS are read from `wandb_metrics_file` when an external image evaluator writes JSON such as `{"fid": 12.3, "is": 5.6}`.
+- `[build_cache]`: prompt file, cache directory, start index, cache batch size, skip-existing resume behavior, resolution, teacher steps, teacher CFG.
+- `[train_xpred]`: cache directory, output directory, `prediction_type`, epoch/step count, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, sigma lower bound, shuffle/drop-last, logging interval, periodic checkpoints, gradient checkpointing, optional training-time sampling, dry run. If `max_train_steps` is omitted, steps are computed from `num_train_epochs`, cache sample count, and effective batch size.
+- `[sample_xpred]`: checkpoint, `prediction_type`, latent output path, prompt, sample count, sampler steps, resolution, epsilon floor.
+- `[chunked_rum]`: automatic rolling loop that builds one cache chunk, trains on it, then continues with the next chunk from the previous checkpoint.
+
+You can run the config's `command` directly:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py --config configs/anima_xpred.example.toml
+```
+
+Or explicitly select a stage with a subcommand:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py build_cache --config configs/anima_xpred.example.toml
+python scripts/dev/anima_rum_xpred_train.py train_xpred --config configs/anima_xpred.example.toml
+python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/anima_xpred.example.toml
+python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
+```
+
+For the current machine, the example already points at:
+
+```text
+/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors
+/root/shared-nvme/anima/split_files/text_encoders/qwen_3_06b_base.safetensors
+/root/shared-nvme/anima/split_files/vae/qwen_image_vae.safetensors
+```
+
+## 3. Toy Smoke
+
+For a fast local smoke test, copy the example config and change these values:
+
+```toml
+[common]
+toy_smoke = true
+mixed_precision = "fp32"
+
+[build_cache]
+cache_dir = "/tmp/rum-anima-xpred-cache-smoke"
+num_samples = 2
+width = 64
+height = 64
+
+[train_xpred]
+cache_dir = "/tmp/rum-anima-xpred-cache-smoke"
+output_dir = "/tmp/rum-anima-xpred-train-smoke"
+max_train_steps = 3
+learning_rate = 1e-4
+
+[sample_xpred]
+checkpoint = "/tmp/rum-anima-xpred-train-smoke/xpred-toy-smoke.pt"
+output = "/tmp/rum-anima-xpred-train-smoke/sample-latent.pt"
+width = 64
+height = 64
+steps = 4
+```
+
+Then run:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py --config /path/to/toy-config.toml
+python scripts/dev/anima_rum_xpred_train.py build_cache --config /path/to/toy-config.toml
+python scripts/dev/anima_rum_xpred_train.py train_xpred --config /path/to/toy-config.toml
+python scripts/dev/anima_rum_xpred_train.py sample_xpred --config /path/to/toy-config.toml
+```
+
+## 4. Real Cache Build
+
+Edit `[build_cache]` in `configs/anima_xpred.example.toml`, then run:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py build_cache --config configs/anima_xpred.example.toml
+```
+
+The cache contains latent tensors only:
+
+- `eps_latent`
+- `x_teacher_latent`
+- text conditioning tensors
+- metadata such as seed, resolution, teacher steps, flow shift, and teacher CFG
+
+It does not decode to pixels.
+
+The current example config uses the Anima Turbo LoRA as a 10-step teacher:
+
+```toml
+[build_cache]
+cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+teacher_steps = 10
+teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
+teacher_lora_weight = 1.0
+```
+
+Do not mix this cache directory with the older base 30-step cache. They are different teacher endpoint distributions.
+
+## 5. Rolling Chunked RUM
+
+For large runs where you do not want to cache everything before training, use:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
+```
+
+The loop is:
+
+```text
+cache chunk-0000 -> train chunk-0000 -> cache chunk-0001 -> train chunk-0001 -> ...
+```
+
+Each next chunk uses the previous chunk's final checkpoint as `student_init`. Resume is controlled by:
+
+```toml
+[chunked_rum]
+chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-chunks"
+total_samples = 30000
+chunk_size = 1024
+resume = true
+delete_cache_after_train = false
+```
+
+Progress is recorded in:
+
+```text
+<chunk_root>/chunk-manifest.json
+```
+
+Set `delete_cache_after_train = true` only when you want to save disk and are comfortable rebuilding a chunk if you need to rerun it. On a single GPU this is sequential, not parallel prefetching.
+
+## 6. Real X-Pred Training
+
+Edit `[train_xpred]`, then run:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py train_xpred --config configs/anima_xpred.example.toml
+```
+
+The student starts from `[common].student_init`; if that is empty, it falls back to `[common].dit`.
+
+Default output:
+
+```text
+/tmp/anima-xpred-train/xpred-adapter-checkpoint.safetensors
+```
+
+Training-time sampling is off by default:
+
+```toml
+[train_xpred]
+sample_every_steps = 0
+```
+
+Set it to a positive optimizer-step interval to sample from the current in-memory student after `optimizer.step()`:
+
+```toml
+[train_xpred]
+sample_every_steps = 1000
+sample_prompt = "hatsune miku, 1girl, ..."
+sample_steps = 10
+sample_num_samples = 2
+sample_eps_floor = 1e-4
+sample_decode_images = true
+sample_wandb_log_images = true
+```
+
+Latents are always saved to:
+
+```text
+<output_dir>/train-samples/latents/
+```
+
+If `sample_decode_images = true`, PNGs are saved to:
+
+```text
+<output_dir>/train-samples/images/step-000000/
+```
+
+For ordinary `train_xpred`, the interval is counted from step 1. For `chunked_rum`, training samples and LR scheduling are counted by total optimizer steps across completed chunks; resumed complete chunks are included in the offset. For example, if completed chunks have 1878 total steps and `sample_every_steps = 500`, the next training sample is written at total step 2000.
+
+If `lr_scheduler_total_steps` is omitted in `chunked_rum`, the script estimates the optimizer-step total for all planned chunks and uses that for cosine decay. This keeps warmup and decay continuous across chunks instead of restarting at each chunk.
+
+When `wandb_enabled = true`, `sample_decode_images = true`, and `sample_wandb_log_images = true`, those PNGs are logged to wandb as `sample/images` at the total training step. Toy smoke saves latent previews only; image decode requires the real Anima VAE.
+
+## Velocity Reflow Control
+
+The main config still defaults to `prediction_type = "x"`. To train a standard velocity reflow student without changing cache format, use:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py train_xpred --config configs/anima_vpred_reflow.example.toml
+```
+
+The v-pred target is:
+
+```text
+target_v = eps_latent - x_teacher_latent
+```
+
+Sampling must also use `prediction_type = "v"`:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/anima_vpred_reflow.example.toml
+```
+
+Do not sample a v-pred checkpoint with `prediction_type = "x"`, and do not sample an x-pred checkpoint with `prediction_type = "v"`.
+
+## 7. Real X-Pred Sampling
+
+Do not use the old Anima FM sampler with an x-pred checkpoint. Use this dedicated sampler:
+
+```bash
+python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/anima_xpred.example.toml
+```
+
+The current sampler writes the final latent tensor. Pixel preview/decode is intentionally separate.
+
+To log visual samples to wandb, enable image decode and wandb in the config:
+
+```toml
+[wandb]
+wandb_enabled = true
+wandb_mode = "offline"  # or leave empty for online logging
+
+[sample_xpred]
+decode_sample_images = true
+sample_image_dir = "/tmp/anima-xpred-sample/images"
+wandb_log_sample_images = true
+```
+
+The sampler will save PNG files locally and log them to wandb as `sample/images`.
+
+## Notes
+
+- `x` means clean Anima VAE latent, not RGB pixels.
+- Teacher CFG defaults to `1.0` to avoid double guidance.
+- Training samples sigma from `[sigma_min_train, 1]` after applying the Anima flow shift.
+- Terminal `sigma=0` is never forwarded through `v=(z-x)/sigma`.
