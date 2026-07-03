@@ -874,6 +874,9 @@ def train_xpred(args: argparse.Namespace) -> None:
                     device=device,
                     dtype=dtype,
                     generator=generator,
+                    time_sampling=args.time_sampling,
+                    logit_mean=args.time_sampling_logit_mean,
+                    logit_std=args.time_sampling_logit_std,
                 )
                 z = (1 - sigma) * sample["x_teacher_latent"] + sigma * sample["eps_latent"]
                 if args.toy_smoke:
@@ -1134,6 +1137,9 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--adam_epsilon", type=float, default=1e-8)
     train.add_argument("--max_grad_norm", type=float, default=1.0)
     train.add_argument("--sigma_min_train", type=float, default=DEFAULT_SIGMA_MIN_TRAIN)
+    train.add_argument("--time_sampling", default="uniform_shifted", choices=["uniform_shifted", "jlt_logit_normal"])
+    train.add_argument("--time_sampling_logit_mean", type=float, default=-0.8)
+    train.add_argument("--time_sampling_logit_std", type=float, default=0.8)
     train.add_argument("--loss_weighting", default="none", choices=["none", "jlt_velocity_readout"])
     train.add_argument("--loss_eps_floor", type=float, default=5e-2)
     train.add_argument("--shuffle_cache", action="store_true", default=True)
@@ -1224,6 +1230,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("loss_weighting='jlt_velocity_readout' requires prediction_type='x'")
     if hasattr(args, "loss_eps_floor") and args.loss_eps_floor <= 0:
         parser.error("loss_eps_floor must be > 0")
+    if hasattr(args, "time_sampling_logit_std") and args.time_sampling_logit_std <= 0:
+        parser.error("time_sampling_logit_std must be > 0")
     if hasattr(args, "global_step_offset") and args.global_step_offset < 0:
         parser.error("global_step_offset must be >= 0")
     if args.command == "chunked_rum":

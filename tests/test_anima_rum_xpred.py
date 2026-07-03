@@ -76,6 +76,28 @@ def test_shifted_sigma_schedule_is_descending_and_training_sigmas_respect_shifte
     assert float(train_sigmas.min()) < shifted_unshifted_min
 
 
+def test_jlt_logit_normal_time_sampling_maps_clean_time_to_anima_sigma():
+    seed = 11
+    generator = torch.Generator().manual_seed(seed)
+    sigmas = sample_train_sigmas(
+        batch_size=8,
+        sigma_min_train=0.02,
+        flow_shift=3.0,
+        device="cpu",
+        dtype=torch.float32,
+        generator=generator,
+        time_sampling="jlt_logit_normal",
+        logit_mean=-0.8,
+        logit_std=0.8,
+    )
+
+    reference_generator = torch.Generator().manual_seed(seed)
+    t = torch.sigmoid(torch.randn(8, generator=reference_generator) * 0.8 - 0.8)
+    expected = (1 - t).clamp(min=0.02, max=1.0).view(8, 1, 1, 1)
+
+    torch.testing.assert_close(sigmas, expected)
+
+
 def test_xpred_cache_roundtrip_keeps_latent_shape_and_metadata(tmp_path):
     x_teacher = torch.randn(1, 16, 8, 8)
     eps = torch.randn(1, 16, 8, 8)

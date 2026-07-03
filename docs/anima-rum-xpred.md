@@ -71,6 +71,14 @@ loss_weighting = "jlt_velocity_readout"
 loss_eps_floor = 5e-2
 ```
 
+JLT also samples clean-time with `t = sigmoid(N(P_mean, P_std))`, using `P_mean=-0.8` and `P_std=0.8` for x-pred runs. In Anima variables this maps to `sigma = 1 - t`. To match that training-time distribution:
+
+```toml
+time_sampling = "jlt_logit_normal"
+time_sampling_logit_mean = -0.8
+time_sampling_logit_std = 0.8
+```
+
 The v1 default remains unweighted clean-latent MSE (`loss_weighting = "none"`) for stability and to keep the RUM endpoint experiment simple; use a separate run when comparing against the JLT-style objective.
 
 ## Shift consistency
@@ -184,6 +192,7 @@ eps_floor = 1e-4
 mixed_precision = bf16
 learning_rate = 1e-6
 loss_weighting = "none"
+time_sampling = "uniform_shifted"
 student_init = teacher_checkpoint
 ```
 

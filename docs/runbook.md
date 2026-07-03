@@ -279,5 +279,5 @@ The sampler will save PNG files locally and log them to wandb as `sample/images`
 
 - `x` means clean Anima VAE latent, not RGB pixels.
 - Teacher CFG defaults to `1.0` to avoid double guidance.
-- Training samples the actual shifted Anima sigma directly from `[sigma_min_train, 1]`.
+- Default training samples the actual shifted Anima sigma directly from `[sigma_min_train, 1]`; `time_sampling="jlt_logit_normal"` uses JLT's `t=sigmoid(N(P_mean,P_std))` and maps to `sigma=1-t`.
 - Terminal `sigma=0` is never forwarded through `v=(z-x)/sigma`.

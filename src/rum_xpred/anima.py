@@ -78,15 +78,24 @@ def sample_train_sigmas(
     device: torch.device | str,
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
+    time_sampling: str = "uniform_shifted",
+    logit_mean: float = -0.8,
+    logit_std: float = 0.8,
 ) -> torch.Tensor:
     if not 0 < sigma_min_train < 1:
         raise ValueError("sigma_min_train must be in (0, 1)")
-    shifted_sigma = sigma_min_train + (1 - sigma_min_train) * torch.rand(
-        batch_size,
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
+    if time_sampling == "uniform_shifted":
+        shifted_sigma = sigma_min_train + (1 - sigma_min_train) * torch.rand(
+            batch_size,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+    elif time_sampling == "jlt_logit_normal":
+        t = torch.sigmoid(torch.randn(batch_size, device=device, dtype=dtype, generator=generator) * logit_std + logit_mean)
+        shifted_sigma = (1 - t).clamp(min=sigma_min_train, max=1.0)
+    else:
+        raise ValueError(f"unsupported time_sampling: {time_sampling!r}")
     return shifted_sigma.view(batch_size, 1, 1, 1)
 
 
