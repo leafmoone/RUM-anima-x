@@ -279,5 +279,5 @@ The sampler will save PNG files locally and log them to wandb as `sample/images`
 
 - `x` means clean Anima VAE latent, not RGB pixels.
 - Teacher CFG defaults to `1.0` to avoid double guidance.
-- Training samples sigma from `[sigma_min_train, 1]` after applying the Anima flow shift.
+- Training samples the actual shifted Anima sigma directly from `[sigma_min_train, 1]`.
 - Terminal `sigma=0` is never forwarded through `v=(z-x)/sigma`.

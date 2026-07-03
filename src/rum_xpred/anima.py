@@ -81,9 +81,12 @@ def sample_train_sigmas(
 ) -> torch.Tensor:
     if not 0 < sigma_min_train < 1:
         raise ValueError("sigma_min_train must be in (0, 1)")
-    u = torch.rand(batch_size, device=device, dtype=dtype, generator=generator)
-    base_sigma = sigma_min_train + (1 - sigma_min_train) * u
-    shifted_sigma = apply_flow_shift(base_sigma, flow_shift)
+    shifted_sigma = sigma_min_train + (1 - sigma_min_train) * torch.rand(
+        batch_size,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
     return shifted_sigma.view(batch_size, 1, 1, 1)
 
 

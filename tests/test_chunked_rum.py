@@ -85,6 +85,13 @@ def test_chunk_train_steps_prefers_manifest_then_summary(tmp_path):
     assert chunk_train_steps({}, tmp_path) == 0
 
 
+def test_chunk_train_steps_can_recover_from_total_completed_steps():
+    previous = {"total_completed_steps": 100}
+    current = {"total_completed_steps": 117}
+
+    assert chunk_train_steps(current, None, previous_chunk=previous) == 17
+
+
 def test_should_run_train_sample_uses_global_step_offset():
     args = argparse.Namespace(sample_every_steps=500, global_step_offset=1314)
 

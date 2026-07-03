@@ -56,6 +56,8 @@ loss = MSE(student(z, sigma, cond), x_teacher_latent)
 
 This reflow target does not replay the teacher's intermediate trajectory. It only distills the teacher endpoint into a new straight flow.
 
+JLT reports a JiT-style implementation where the clean prediction is read out to velocity before computing loss, which weights clean prediction error by `(1 - t)^-2`. Under Anima variables, `1 - t = sigma`. This project's v1 default intentionally uses unweighted clean-latent MSE (`loss_weighting = none`) for stability and to keep the RUM endpoint experiment simple; it is not an exact reproduction of JLT's weighted training loss.
+
 ## Shift consistency
 
 Use the same shifted `sigma` everywhere:

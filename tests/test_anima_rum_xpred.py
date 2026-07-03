@@ -50,7 +50,7 @@ def test_reflow_training_target_supports_x_and_v_prediction():
     assert reflow_training_target("v", x_teacher, eps).item() == 3.0
 
 
-def test_shifted_sigma_schedule_is_descending_and_training_sigmas_use_same_shift():
+def test_shifted_sigma_schedule_is_descending_and_training_sigmas_respect_shifted_minimum():
     sigmas = make_shifted_sigma_schedule(steps=4, flow_shift=3.0, device="cpu", dtype=torch.float32)
 
     assert sigmas[0] == 1
@@ -68,9 +68,12 @@ def test_shifted_sigma_schedule_is_descending_and_training_sigmas_use_same_shift
     )
 
     assert train_sigmas.shape == (128, 1, 1, 1)
-    assert float(train_sigmas.min()) >= float(make_shifted_sigma_schedule(1, 3.0, "cpu", torch.float32)[-2]) * 0
     assert float(train_sigmas.min()) >= 0.02
     assert float(train_sigmas.max()) <= 1.0
+
+    unshifted_min = 0.02
+    shifted_unshifted_min = 3.0 * unshifted_min / (1 + (3.0 - 1) * unshifted_min)
+    assert float(train_sigmas.min()) < shifted_unshifted_min
 
 
 def test_xpred_cache_roundtrip_keeps_latent_shape_and_metadata(tmp_path):

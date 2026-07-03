@@ -428,10 +428,15 @@ def completed_chunk_ids(manifest: dict) -> set[int]:
     }
 
 
-def chunk_train_steps(chunk: dict, fallback_output_dir: Path) -> int:
+def chunk_train_steps(chunk: dict, fallback_output_dir: Path | None, previous_chunk: dict | None = None) -> int:
     value = chunk.get("train_steps")
     if isinstance(value, int) and value >= 0:
         return value
+    total_completed_steps = chunk.get("total_completed_steps")
+    if isinstance(total_completed_steps, int) and total_completed_steps >= 0:
+        previous_total = previous_chunk.get("total_completed_steps") if previous_chunk else None
+        if isinstance(previous_total, int) and 0 <= previous_total <= total_completed_steps:
+            return total_completed_steps - previous_total
     output_dir = Path(chunk.get("output_dir") or fallback_output_dir)
     summary_path = output_dir / "train-summary.json"
     if not summary_path.exists():
@@ -711,7 +716,8 @@ def chunked_rum(args: argparse.Namespace) -> None:
             optimizer_state = completed_chunk.get("optimizer_state")
             if optimizer_state:
                 previous_optimizer_state = str(optimizer_state)
-            global_step_offset += chunk_train_steps(completed_chunk, chunk_output_dir)
+            previous_manifest_chunk = manifest_by_chunk_id.get(plan.chunk_id - 1)
+            global_step_offset += chunk_train_steps(completed_chunk, chunk_output_dir, previous_chunk=previous_manifest_chunk)
             continue
 
         cache_args = make_stage_args(args.config, "build_cache")
@@ -761,6 +767,8 @@ def chunked_rum(args: argparse.Namespace) -> None:
             checkpoint=str(checkpoint),
             optimizer_state=str(optimizer_state),
             train_steps=getattr(train_args, "completed_train_steps", None) or getattr(train_args, "resolved_max_train_steps", None),
+            total_completed_steps=global_step_offset
+            + (getattr(train_args, "completed_train_steps", 0) or getattr(train_args, "resolved_max_train_steps", 0)),
         )
         global_step_offset += getattr(train_args, "completed_train_steps", 0) or getattr(train_args, "resolved_max_train_steps", 0)
         if args.delete_cache_after_train:
