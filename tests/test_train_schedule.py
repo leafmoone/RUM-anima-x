@@ -3,7 +3,7 @@ import argparse
 import torch
 
 from anima_rum_xpred import CacheMetadata, load_xpred_cache_sample, save_xpred_cache_sample
-from scripts.dev.anima_rum_xpred_train import build_cache, final_optimizer_state_for_train_args, resolve_max_train_steps, train_xpred
+from scripts.dev.anima_rum_xpred_train import build_cache, final_optimizer_state_for_train_args, reflow_loss, resolve_max_train_steps, train_xpred
 
 
 def test_resolve_max_train_steps_from_epochs():
@@ -74,6 +74,8 @@ def test_train_xpred_saves_and_loads_optimizer_state(tmp_path):
         adam_epsilon=1e-8,
         max_grad_norm=1.0,
         sigma_min_train=0.02,
+        loss_weighting="none",
+        loss_eps_floor=5e-2,
         flow_shift=3.0,
         shuffle_cache=False,
         drop_last=False,
@@ -101,6 +103,19 @@ def test_train_xpred_saves_and_loads_optimizer_state(tmp_path):
 
     assert second_state["completed_train_steps"] == 1
     assert second_state["optimizer"]["state"]
+
+
+def test_jlt_velocity_readout_loss_matches_sigma_weighted_x_error():
+    x_target = torch.tensor([[[[2.0]]]])
+    x_pred = torch.tensor([[[[2.25]]]])
+    eps = torch.tensor([[[[5.0]]]])
+    sigma = torch.tensor([[[[0.5]]]])
+    z = (1 - sigma) * x_target + sigma * eps
+
+    loss = reflow_loss("x", "jlt_velocity_readout", x_pred, x_target, z, sigma, eps_floor=5e-2)
+
+    expected = ((x_pred - x_target) / sigma).pow(2).mean()
+    torch.testing.assert_close(loss, expected)
 
 
 def test_build_cache_bucket_enabled_writes_resolution_subdirs(tmp_path):

@@ -74,6 +74,8 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "adam_epsilon": 1e-8,
         "max_grad_norm": 1.0,
         "sigma_min_train": 0.02,
+        "loss_weighting": "none",
+        "loss_eps_floor": 5e-2,
         "shuffle_cache": True,
         "drop_last": False,
         "log_every": 1,

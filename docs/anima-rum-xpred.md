@@ -56,7 +56,22 @@ loss = MSE(student(z, sigma, cond), x_teacher_latent)
 
 This reflow target does not replay the teacher's intermediate trajectory. It only distills the teacher endpoint into a new straight flow.
 
-JLT reports a JiT-style implementation where the clean prediction is read out to velocity before computing loss, which weights clean prediction error by `(1 - t)^-2`. Under Anima variables, `1 - t = sigma`. This project's v1 default intentionally uses unweighted clean-latent MSE (`loss_weighting = none`) for stability and to keep the RUM endpoint experiment simple; it is not an exact reproduction of JLT's weighted training loss.
+JLT's public implementation uses a JiT-style x-pred loss: the clean prediction is read out to velocity before computing loss. In JLT variables this is `v_pred = (x_pred - z_t) / (1 - t)` and `loss = MSE(v_pred, v)`, which weights clean prediction error by `(1 - t)^-2`. Under Anima variables, `1 - t = sigma` and `v_anima = -v_jlt`, so the equivalent loss is:
+
+```text
+v_pred = (z - x_pred) / max(sigma, loss_eps_floor)
+v_target = (z - x_teacher_latent) / max(sigma, loss_eps_floor)
+loss = MSE(v_pred, v_target)
+```
+
+This project exposes that as:
+
+```toml
+loss_weighting = "jlt_velocity_readout"
+loss_eps_floor = 5e-2
+```
+
+The v1 default remains unweighted clean-latent MSE (`loss_weighting = "none"`) for stability and to keep the RUM endpoint experiment simple; use a separate run when comparing against the JLT-style objective.
 
 ## Shift consistency
 
@@ -168,7 +183,7 @@ sigma_min_train = 0.02
 eps_floor = 1e-4
 mixed_precision = bf16
 learning_rate = 1e-6
-loss_weighting = none
+loss_weighting = "none"
 student_init = teacher_checkpoint
 ```
 

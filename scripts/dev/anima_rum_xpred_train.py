@@ -39,6 +39,7 @@ from rum_xpred.anima import (
     sample_with_vpred_student,
     sample_with_xpred_student,
     save_xpred_cache_sample,
+    xpred_to_anima_v,
 )
 from rum_xpred.config import config_to_namespace, load_toml_config
 
@@ -351,6 +352,26 @@ def read_wandb_external_metrics(path: str | None) -> dict[str, float]:
         metric_key = aliases.get(key, key if "/" in key else f"eval/{key}")
         metrics[metric_key] = float(value)
     return metrics
+
+
+def reflow_loss(
+    prediction_type: str,
+    loss_weighting: str,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    z: torch.Tensor,
+    sigma: torch.Tensor,
+    eps_floor: float,
+) -> torch.Tensor:
+    if loss_weighting == "none":
+        return torch.nn.functional.mse_loss(prediction.float(), target.float())
+    if loss_weighting == "jlt_velocity_readout":
+        if prediction_type != "x":
+            raise ValueError("loss_weighting='jlt_velocity_readout' is only valid with prediction_type='x'")
+        v_pred = xpred_to_anima_v(z.float(), prediction.float(), sigma.float(), eps_floor)
+        v_target = xpred_to_anima_v(z.float(), target.float(), sigma.float(), eps_floor)
+        return torch.nn.functional.mse_loss(v_pred, v_target)
+    raise ValueError(f"unsupported loss_weighting: {loss_weighting!r}")
 
 
 def serializable_args(args: argparse.Namespace) -> dict:
@@ -860,7 +881,15 @@ def train_xpred(args: argparse.Namespace) -> None:
                 else:
                     prediction = adapter.student_forward_xpred(student, z, sigma, sample["text_conditioning"])
                 target = reflow_training_target(args.prediction_type, sample["x_teacher_latent"], sample["eps_latent"])
-                loss_value = torch.nn.functional.mse_loss(prediction.float(), target.float())
+                loss_value = reflow_loss(
+                    args.prediction_type,
+                    args.loss_weighting,
+                    prediction,
+                    target,
+                    z,
+                    sigma,
+                    args.loss_eps_floor,
+                )
                 if not torch.isfinite(loss_value):
                     raise FloatingPointError(f"non-finite {args.prediction_type}-pred loss")
                 (loss_value / args.gradient_accumulation_steps).backward()
@@ -1105,6 +1134,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--adam_epsilon", type=float, default=1e-8)
     train.add_argument("--max_grad_norm", type=float, default=1.0)
     train.add_argument("--sigma_min_train", type=float, default=DEFAULT_SIGMA_MIN_TRAIN)
+    train.add_argument("--loss_weighting", default="none", choices=["none", "jlt_velocity_readout"])
+    train.add_argument("--loss_eps_floor", type=float, default=5e-2)
     train.add_argument("--shuffle_cache", action="store_true", default=True)
     train.add_argument("--drop_last", action="store_true")
     train.add_argument("--log_every", type=int, default=1)
@@ -1189,6 +1220,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("sample_xpred requires checkpoint and output")
     if hasattr(args, "prediction_type") and args.prediction_type not in {"x", "v"}:
         parser.error("prediction_type must be 'x' or 'v'")
+    if hasattr(args, "loss_weighting") and args.loss_weighting == "jlt_velocity_readout" and args.prediction_type != "x":
+        parser.error("loss_weighting='jlt_velocity_readout' requires prediction_type='x'")
+    if hasattr(args, "loss_eps_floor") and args.loss_eps_floor <= 0:
+        parser.error("loss_eps_floor must be > 0")
     if hasattr(args, "global_step_offset") and args.global_step_offset < 0:
         parser.error("global_step_offset must be >= 0")
     if args.command == "chunked_rum":
