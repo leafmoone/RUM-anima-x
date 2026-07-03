@@ -298,6 +298,8 @@ def init_wandb(args: argparse.Namespace):
         "project": args.wandb_project,
         "entity": args.wandb_entity,
         "name": args.wandb_run_name,
+        "id": getattr(args, "wandb_run_id", None),
+        "resume": getattr(args, "wandb_resume", None),
         "mode": args.wandb_mode,
         "tags": args.wandb_tags,
         "notes": args.wandb_notes,
@@ -1041,6 +1043,8 @@ def add_wandb_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wandb_project", default="rum-anima-xpred")
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_run_id", default=None)
+    parser.add_argument("--wandb_resume", default=None)
     parser.add_argument("--wandb_mode", default=None)
     parser.add_argument("--wandb_tags", nargs="*", default=[])
     parser.add_argument("--wandb_notes", default=None)

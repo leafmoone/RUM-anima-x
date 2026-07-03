@@ -128,6 +128,8 @@ WANDB_DEFAULTS: dict[str, Any] = {
     "wandb_project": "rum-anima-xpred",
     "wandb_entity": None,
     "wandb_run_name": None,
+    "wandb_run_id": None,
+    "wandb_resume": None,
     "wandb_mode": None,
     "wandb_tags": [],
     "wandb_notes": None,

@@ -63,6 +63,8 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
                 "wandb_enabled": True,
                 "wandb_project": "test-project",
                 "wandb_mode": "offline",
+                "wandb_run_id": "fixed-run",
+                "wandb_resume": "allow",
                 "wandb_tags": ["smoke", "xpred"],
                 "wandb_metrics_file": "/tmp/eval.json",
                 "wandb_metrics_log_every": 5,
@@ -91,6 +93,8 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
     assert args.wandb_enabled is True
     assert args.wandb_project == "test-project"
     assert args.wandb_mode == "offline"
+    assert args.wandb_run_id == "fixed-run"
+    assert args.wandb_resume == "allow"
     assert args.wandb_tags == ["smoke", "xpred"]
     assert args.wandb_metrics_file == "/tmp/eval.json"
     assert args.wandb_metrics_log_every == 5
