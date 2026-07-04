@@ -154,3 +154,127 @@ def test_build_cache_bucket_enabled_writes_resolution_subdirs(tmp_path):
     assert len({path.parent.name for path in files}) > 1
     sample = load_xpred_cache_sample(files[0], device="cpu", dtype=torch.float32)
     assert f"{sample['width']}x{sample['height']}" == files[0].parent.name
+
+
+def test_build_cache_prompt_sets_write_to_separate_dirs(tmp_path):
+    tag_prompts = tmp_path / "tag.txt"
+    nl_prompts = tmp_path / "nl.txt"
+    tag_prompts.write_text("tag a\ntag b\n", encoding="utf-8")
+    nl_prompts.write_text("nl a\nnl b\n", encoding="utf-8")
+    tag_cache = tmp_path / "tag-cache"
+    nl_cache = tmp_path / "nl-cache"
+    args = argparse.Namespace(
+        device="cpu",
+        mixed_precision="fp32",
+        prompts=None,
+        cache_dir=None,
+        prompt_sets=[
+            {"name": "tag", "prompts": str(tag_prompts), "cache_dir": str(tag_cache), "start_index": 0, "num_samples": 2},
+            {"name": "nl", "prompts": str(nl_prompts), "cache_dir": str(nl_cache), "start_index": 0, "num_samples": 2},
+        ],
+        num_samples=None,
+        start_index=0,
+        cache_batch_size=2,
+        skip_existing=True,
+        bucket_enabled=False,
+        width=64,
+        height=64,
+        teacher_steps=1,
+        flow_shift=3.0,
+        teacher_cfg=1.0,
+        teacher_lora=None,
+        teacher_lora_weight=1.0,
+        seed=11,
+        toy_smoke=True,
+        adapter="",
+    )
+
+    build_cache(args)
+
+    assert len(list(tag_cache.glob("*.safetensors"))) == 2
+    assert len(list(nl_cache.glob("*.safetensors"))) == 2
+    assert (tag_cache / "sample-000000.safetensors").exists()
+    assert (nl_cache / "sample-000000.safetensors").exists()
+
+
+def test_train_xpred_accepts_multiple_cache_dirs(tmp_path):
+    cache_a = tmp_path / "cache-a"
+    cache_b = tmp_path / "cache-b"
+    cache_a.mkdir()
+    cache_b.mkdir()
+    for cache_dir, offset in [(cache_a, 0), (cache_b, 100)]:
+        for i in range(2):
+            sample_index = offset + i
+            metadata = CacheMetadata(
+                prompt=f"toy {sample_index}",
+                width=64,
+                height=64,
+                seed=1,
+                sample_index=sample_index,
+                teacher_steps=1,
+                flow_shift=3.0,
+                teacher_cfg=1.0,
+            )
+            save_xpred_cache_sample(
+                cache_dir / f"sample-{sample_index:06d}.safetensors",
+                torch.randn(1, 16, 8, 8),
+                torch.randn(1, 16, 8, 8),
+                {"prompt_embeds": torch.randn(1, 4, 8)},
+                metadata,
+            )
+    args = argparse.Namespace(
+        device="cpu",
+        mixed_precision="fp32",
+        cache_dir=None,
+        cache_dirs=[str(cache_a), str(cache_b)],
+        cache_mix_mode="single",
+        cache_mix_weights=[0.5, 0.5],
+        output_dir=str(tmp_path / "train"),
+        toy_smoke=True,
+        adapter="",
+        student_init=None,
+        optimizer_state=None,
+        prediction_type="x",
+        max_train_steps=None,
+        num_train_epochs=1.0,
+        train_batch_size=2,
+        gradient_accumulation_steps=1,
+        learning_rate=1e-4,
+        lr_scheduler="constant",
+        lr_warmup_steps=0,
+        lr_cosine_min=0.1,
+        lr_scheduler_total_steps=None,
+        weight_decay=0.0,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        adam_epsilon=1e-8,
+        max_grad_norm=1.0,
+        sigma_min_train=0.02,
+        time_sampling="uniform_shifted",
+        time_sampling_logit_mean=-0.8,
+        time_sampling_logit_std=0.8,
+        loss_weighting="none",
+        loss_eps_floor=5e-2,
+        flow_shift=3.0,
+        shuffle_cache=False,
+        drop_last=False,
+        seed=1,
+        log_every=10,
+        save_every_steps=None,
+        checkpoints_total_limit=None,
+        gradient_checkpointing=False,
+        gradient_checkpointing_cpu_offload=False,
+        gradient_checkpointing_unsloth_offload=False,
+        sample_every_steps=0,
+        dry_run=False,
+        wandb_enabled=False,
+        wandb_metrics_log_every=0,
+        wandb_metrics_file=None,
+        global_step_offset=0,
+    )
+
+    train_xpred(args)
+
+    assert args.resolved_max_train_steps == 2
+    assert args.cache_mix_mode == "batch_weighted"
+    assert final_optimizer_state_for_train_args(args).exists()

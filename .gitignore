@@ -22,6 +22,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+watch_upload_completed_cache_chunks.sh
 
 # Logs and experiment trackers
 logs/
@@ -52,6 +53,7 @@ cache_data/
 *cache*/
 anima-xpred-chunks/
 anima-xpred-turbo10-chunks/
+anima-jlt-xpred-turbo10-chunks/
 chunk-manifest.json
 
 # Legacy QAT artifacts from the source workspace

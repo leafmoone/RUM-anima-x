@@ -3,16 +3,20 @@ import argparse
 from scripts.dev.anima_rum_xpred_train import (
     DEFAULT_CACHE_BUCKETS,
     CacheBucketBatchCursor,
+    MultiCacheBucketBatchCursor,
     ChunkPlan,
+    allocate_weighted_counts,
     chunk_train_steps,
     completed_chunk_ids,
     final_optimizer_state_for_train_args,
     bucket_cache_path,
+    chunk_cache_dirs_for_prompt_sets,
     choose_cache_bucket,
     collect_cache_buckets,
     lr_scale_for_step,
     make_chunk_plan,
     planned_chunk_train_steps,
+    prompt_set_chunk_name,
     resolve_chunk_optimizer_state,
     resolve_chunk_student_init,
     should_run_train_sample,
@@ -115,6 +119,38 @@ def test_planned_chunk_train_steps_sums_auto_steps_across_chunks():
     assert planned_chunk_train_steps(train_args, chunk_args, plans) == 4
 
 
+def test_planned_chunk_train_steps_can_multiply_cache_sets():
+    train_args = argparse.Namespace(
+        max_train_steps=None,
+        train_batch_size=4,
+        gradient_accumulation_steps=2,
+        num_train_epochs=1.0,
+    )
+    chunk_args = argparse.Namespace(train_steps_per_chunk=None)
+    plans = [ChunkPlan(chunk_id=0, start_index=0, num_samples=16)]
+
+    assert planned_chunk_train_steps(train_args, chunk_args, plans, cache_multiplier=2) == 4
+
+
+def test_prompt_set_chunk_offset_maps_sources_to_different_chunk_numbers(tmp_path):
+    prompt_sets = [
+        {"name": "tag", "cache_dir": str(tmp_path / "tag"), "cache_chunk_offset": 14},
+        {"name": "nl", "cache_dir": str(tmp_path / "nl"), "cache_chunk_offset": 0},
+    ]
+
+    assert prompt_set_chunk_name(prompt_sets[0], training_chunk_id=0) == "chunk-0014"
+    assert prompt_set_chunk_name(prompt_sets[1], training_chunk_id=0) == "chunk-0000"
+    assert chunk_cache_dirs_for_prompt_sets(prompt_sets, training_chunk_id=1) == [
+        str(tmp_path / "tag" / "chunk-0015"),
+        str(tmp_path / "nl" / "chunk-0001"),
+    ]
+
+
+def test_allocate_weighted_counts_splits_batch_and_preserves_total():
+    assert allocate_weighted_counts(batch_size=8, weights=[0.5, 0.5]) == [4, 4]
+    assert sum(allocate_weighted_counts(batch_size=7, weights=[0.7, 0.3])) == 7
+
+
 def test_lr_scale_can_use_total_step_across_chunks():
     args = argparse.Namespace(
         lr_scheduler="cosine",
@@ -178,3 +214,29 @@ def test_cache_bucket_cursor_returns_one_bucket_per_batch(tmp_path):
 
     assert len(batch) == 2
     assert {path.parent.name for path in batch} in [{"1024x1024"}, {"832x1216"}]
+
+
+def test_multi_cache_bucket_cursor_mixes_sources_within_one_resolution(tmp_path):
+    source_a = tmp_path / "a" / "1024x1024"
+    source_b = tmp_path / "b" / "1024x1024"
+    source_a.mkdir(parents=True)
+    source_b.mkdir(parents=True)
+    for index in range(8):
+        (source_a / f"sample-{index:06d}.safetensors").write_text("a", encoding="utf-8")
+        (source_b / f"sample-{index + 100:06d}.safetensors").write_text("b", encoding="utf-8")
+
+    cursor = MultiCacheBucketBatchCursor(
+        [collect_cache_buckets(tmp_path / "a"), collect_cache_buckets(tmp_path / "b")],
+        batch_size=8,
+        weights=[0.5, 0.5],
+        shuffle=False,
+        seed=1,
+        drop_last=False,
+    )
+
+    batch = cursor.next()
+
+    assert len(batch) == 8
+    assert sum("/a/" in str(path) for path in batch) == 4
+    assert sum("/b/" in str(path) for path in batch) == 4
+    assert {path.parent.name for path in batch} == {"1024x1024"}

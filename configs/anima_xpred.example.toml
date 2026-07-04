@@ -22,17 +22,17 @@ command = "chunked_rum"
 #   python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
 
 # rolling cache、分段训练输出和 manifest 的根目录。
-chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-turbo10-chunks"
+chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks"
 
 # 总共处理多少条 prompt。比如 30000 表示从 start_index 开始处理 30000 条。
-total_samples = 30000
+total_samples =108000
 
 # 每次 cache 一段多少样本，然后用这一段训练。
 # 数值越大，cache 占盘越多；越小，切换 teacher/student 的频率越高。
 chunk_size = 3000
 
 # 第一段从 prompt 文件的哪个 index 开始。
-start_index = 0
+start_index = 69000
 
 # 可选：只跑前 N 个 chunk，适合 smoke 或中断调试；删除表示一直跑完 total_samples。
 # max_chunks = 1
@@ -43,7 +43,7 @@ start_index = 0
 
 # true 时每个 chunk 训练完成后删除对应 cache，省磁盘。
 # 注意：删除后无法重新训练该 chunk，除非重新 build cache。
-delete_cache_after_train = true
+delete_cache_after_train = false
 
 # true 时读取 chunk-manifest.json，跳过已 complete 的 chunk。
 resume = true
@@ -71,7 +71,7 @@ adapter = "rum_xpred.adapters.anima_sd_scripts:create_adapter"
 dit = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
 
 # student 初始化 checkpoint；留空时 train_xpred 默认从 dit 初始化。
-student_init = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+student_init = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-turbo10-chunks/train/chunk-0022/xpred-adapter-checkpoint.safetensors"
 
 # Qwen3 text encoder。当前真实 adapter 必须提供。
 text_encoder = "/root/shared-nvme/anima/split_files/text_encoders/qwen_3_06b_base.safetensors"
@@ -101,9 +101,15 @@ text_encoder_cpu = false
 wandb_enabled = true
 
 # wandb 基础信息。wandb_mode 可设为 "offline" 做本地记录。
-wandb_project = "rum-anima-xpred"
+wandb_project = "rum-anima-xpred-jlt"
 wandb_entity = ""
 wandb_run_name = "anima-xpred-rum"
+
+# 固定 run id 后，chunked_rum 每个 chunk 重新 wandb.init 也会接到同一个 W&B run。
+# 第一次使用某个 id 时会创建 run；之后 resume="allow" 会继续写入同一个 run。
+wandb_run_id = "anima-xpred-rum-jlt-20260703"
+wandb_resume = "allow"
+
 wandb_mode = ""
 wandb_tags = ["anima", "rum", "xpred"]
 wandb_notes = "Anima latent x-pred RUM reflow experiment."
@@ -124,24 +130,46 @@ wandb_metrics_log_every = 0
 prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
 
 # teacher endpoint cache 输出目录。turbo LoRA cache 不要和 base 30-step cache 混用。
-cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+cache_dir = "/root/shared-nvme/cache_data/150000"
+
+# 可选：多 prompt set 构建。启用时会忽略上面的 prompts/cache_dir/start_index/num_samples，
+# 每个 set 写入自己的 cache_dir，允许不同 prompt 文件从 sample-000000 开始而不重名。
+# chunked_rum 下会自动在每个 cache_dir 后追加 chunk-XXXX。
+#
+# [[build_cache.prompt_sets]]
+# name = "tag"
+# prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
+# cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/tag"
+# start_index = 177000
+# num_samples = 50000
+# 可选：训练 chunk-0000 对应这个 set 的 cache/chunk-0014，chunk-0001 对应 chunk-0015。
+# 适合复用已经从 chunk-0014 开始整理好的 tag cache。
+# cache_chunk_offset = 14
+#
+# [[build_cache.prompt_sets]]
+# name = "short_nl"
+# prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
+# cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl"
+# start_index = 0
+# num_samples = 50000
+# cache_chunk_offset = 0
 
 # 只读取前 N 条 prompt；null 表示读取全部。
-num_samples = 30000
+num_samples = 300000
 
 # 从 prompt 文件的第几个样本开始，便于分块构建 cache。
-start_index = 0
+start_index = 150000
 
 # cache 构建 batch size。真实 adapter 会把多个 prompt 的 embedding 拼 batch 后一次跑 teacher schedule。
 # 受 DiT + Qwen3 显存影响，建议从 1 或 2 开始试。
-cache_batch_size = 28
+cache_batch_size = 54
 
 # true 时已有 sample-xxxxxx.safetensors 会跳过，便于断点续建 cache。
 skip_existing = true
 
 # true 时启用内置固定分辨率分桶；样本会按 seed/index 随机但确定地写入 cache_dir/宽x高/。
 # 具体 bucket 列表由代码固定，不需要在配置里手动指定。
-bucket_enabled = false
+bucket_enabled = true
 
 # 生成 latent 对应的图像尺寸；必须能被 Anima/VAE latent scale 整除。
 # bucket_enabled=false 时使用这里的单一尺寸；bucket_enabled=true 时这里仅作为非分桶兼容默认值。
@@ -164,6 +192,16 @@ teacher_lora_weight = 1.0
 # build_cache 输出的 safetensors cache 目录。
 cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
 
+# 可选：多个 cache 目录混合训练。启用 cache_dirs 后会忽略 cache_dir。
+# chunked_rum + build_cache.prompt_sets 会自动填入每个 set 的当前 chunk 目录。
+# 单独 train_xpred 时可手动写入目录。
+# cache_dirs = [
+#   "/root/shared-nvme/RUM-anima-xpred/cache_mix/tag/chunk-0000",
+#   "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl/chunk-0000",
+# ]
+# cache_mix_mode = "batch_weighted"
+# cache_mix_weights = [0.5, 0.5]
+
 # x-pred checkpoint 输出目录。
 output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train"
 
@@ -174,13 +212,13 @@ num_train_epochs = 1.0
 # max_train_steps = 7500
 
 # 每个 micro step 从 cache 读取多少样本。
-train_batch_size = 12
+train_batch_size = 8
 
 # 梯度累积步数。有效 batch = train_batch_size * gradient_accumulation_steps。
 gradient_accumulation_steps = 4
 
 # 全量 DiT 转换默认小学习率。
-learning_rate = 5e-5
+learning_rate = 1e-5
 
 # 学习率调度：constant 或 cosine。
 lr_scheduler = "cosine"
@@ -189,7 +227,7 @@ lr_scheduler = "cosine"
 lr_warmup_steps = 1000
 
 # cosine 最低学习率比例，例如 0.1 表示最低到 learning_rate * 0.1。
-lr_cosine_min = 0.1
+lr_cosine_min = 0.3
 
 # cosine 总步数；普通 train_xpred 未设置时使用本次训练步数。
 # chunked_rum 未设置时会自动估算所有 chunk 的总 optimizer step，避免每个块重置衰减。
@@ -207,6 +245,23 @@ max_grad_norm = 1.0
 # 训练 sigma 下界。太接近 0 时 sampler 的 (z - x) / sigma 会放大误差。
 sigma_min_train = 0.02
 
+# time_sampling:
+#   "uniform_shifted"  = 直接在实际 Anima shifted sigma 的 [sigma_min_train, 1] 均匀采样。
+#   "jlt_logit_normal" = 复刻 JLT 的 t=sigmoid(N(P_mean,P_std))，再映射到 Anima sigma=1-t。
+time_sampling = "jlt_logit_normal"
+time_sampling_logit_mean = -0.8
+time_sampling_logit_std = 0.8
+
+# loss_weighting:
+#   "none"                 = 直接 MSE(x_pred, x_teacher_latent)，当前 RUM x-pred 默认。
+#   "jlt_velocity_readout" = 复刻 JLT x-pred 训练损失：先用 (z - x_pred) / sigma 读出 Anima velocity，
+#                            再与 target velocity 做 MSE，等价于按 1/sigma^2 加权 clean error。
+loss_weighting = "jlt_velocity_readout"
+
+# JLT 论文代码 t_eps 默认 5e-2；在 Anima 变量中就是 sigma 分母 floor。
+# 仅 loss_weighting="jlt_velocity_readout" 时影响训练 loss。
+loss_eps_floor = 5e-2
+
 # true 时训练按随机顺序循环 cache。
 shuffle_cache = true
 
@@ -220,7 +275,7 @@ log_every = 1
 save_every_steps = 1000
 
 # 周期 checkpoint 保留数量；删除或注释表示不自动删除旧 checkpoint。
-checkpoints_total_limit = 20
+checkpoints_total_limit = 3
 
 # Anima DiT 训练梯度检查点。省显存但会变慢。
 gradient_checkpointing = true
@@ -238,7 +293,7 @@ sample_every_steps = 50
 sample_prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
 
 # 训练中 sample 的步数、数量、尺寸。sample_width/height 删除或注释时默认使用训练尺寸。
-sample_steps = 10
+sample_steps = 30
 sample_num_samples = 2
 sample_eps_floor = 1e-4
 # sample_width = 1024
@@ -272,7 +327,7 @@ prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua neckti
 num_samples = 2
 
 # x-pred Euler 采样步数。
-steps = 10
+steps = 30
 
 # 采样尺寸，需与目标 latent shape 对应。
 width = 1024

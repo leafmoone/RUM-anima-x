@@ -173,6 +173,39 @@ def test_config_loads_chunked_rum_settings():
     assert args.resume is False
 
 
+def test_config_loads_prompt_sets_and_cache_dirs():
+    build_args = config_to_namespace(
+        {
+            "command": "build_cache",
+            "common": {"toy_smoke": True},
+            "build_cache": {
+                "prompt_sets": [
+                    {"name": "tag", "prompts": "/tmp/tag.txt", "cache_dir": "/tmp/tag-cache", "start_index": 10, "num_samples": 30},
+                    {"name": "nl", "prompts": "/tmp/nl.txt", "cache_dir": "/tmp/nl-cache", "start_index": 0, "num_samples": 30},
+                ]
+            },
+        }
+    )
+    train_args = config_to_namespace(
+        {
+            "command": "train_xpred",
+            "common": {"toy_smoke": True},
+            "train_xpred": {
+                "cache_dirs": ["/tmp/tag-cache", "/tmp/nl-cache"],
+                "cache_mix_mode": "batch_weighted",
+                "cache_mix_weights": [0.5, 0.5],
+                "output_dir": "/tmp/out",
+            },
+        }
+    )
+
+    assert build_args.prompt_sets[0]["name"] == "tag"
+    assert build_args.prompt_sets[1]["cache_dir"] == "/tmp/nl-cache"
+    assert train_args.cache_dirs == ["/tmp/tag-cache", "/tmp/nl-cache"]
+    assert train_args.cache_mix_mode == "batch_weighted"
+    assert train_args.cache_mix_weights == [0.5, 0.5]
+
+
 def test_config_rejects_unknown_sections():
     with pytest.raises(ValueError, match="unknown config section"):
         config_to_namespace({"command": "build_cache", "typo": {}})

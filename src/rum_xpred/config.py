@@ -41,6 +41,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
     "build_cache": {
         "prompts": None,
         "cache_dir": None,
+        "prompt_sets": None,
         "num_samples": None,
         "start_index": 0,
         "cache_batch_size": 1,
@@ -55,6 +56,9 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "train_xpred": {
         "cache_dir": None,
+        "cache_dirs": None,
+        "cache_mix_mode": "single",
+        "cache_mix_weights": None,
         "output_dir": None,
         "prediction_type": "x",
         "global_step_offset": 0,

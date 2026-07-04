@@ -182,16 +182,18 @@ class CacheBatchCursor:
         if self.shuffle:
             self.rng.shuffle(self.cache_files)
 
-    def next(self) -> list[Path]:
+    def next_count(self, count: int) -> list[Path]:
+        if count < 1:
+            return []
         selected = []
-        while len(selected) < self.batch_size:
+        while len(selected) < count:
             remaining = len(self.cache_files) - self.position
-            need = self.batch_size - len(selected)
+            need = count - len(selected)
             take = min(remaining, need)
             if take:
                 selected.extend(self.cache_files[self.position : self.position + take])
                 self.position += take
-            if len(selected) == self.batch_size:
+            if len(selected) == count:
                 return selected
             self.position = 0
             if self.shuffle:
@@ -199,6 +201,9 @@ class CacheBatchCursor:
             if self.drop_last and selected:
                 selected = []
         return selected
+
+    def next(self) -> list[Path]:
+        return self.next_count(self.batch_size)
 
 
 class CacheBucketBatchCursor:
@@ -223,6 +228,96 @@ class CacheBucketBatchCursor:
         index = self.order[self.position]
         self.position = (self.position + 1) % len(self.order)
         return self.cursors[index].next()
+
+
+def allocate_weighted_counts(batch_size: int, weights: list[float]) -> list[int]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if not weights:
+        raise ValueError("at least one weight is required")
+    if any(weight < 0 for weight in weights) or sum(weights) <= 0:
+        raise ValueError("cache mix weights must be non-negative and sum to > 0")
+    total = float(sum(weights))
+    raw = [batch_size * float(weight) / total for weight in weights]
+    counts = [int(math.floor(value)) for value in raw]
+    remaining = batch_size - sum(counts)
+    order = sorted(range(len(weights)), key=lambda index: raw[index] - counts[index], reverse=True)
+    for index in order[:remaining]:
+        counts[index] += 1
+    return counts
+
+
+class MultiCacheBucketBatchCursor:
+    def __init__(
+        self,
+        cache_bucket_sets: list[list[CacheBucket]],
+        batch_size: int,
+        *,
+        weights: list[float] | None,
+        shuffle: bool,
+        seed: int,
+        drop_last: bool,
+    ) -> None:
+        if len(cache_bucket_sets) < 2:
+            raise ValueError("multi cache cursor requires at least two cache dirs")
+        if batch_size < 1:
+            raise ValueError("train_batch_size must be >= 1")
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.rng = random.Random(seed)
+        if weights is None:
+            weights = [1.0] * len(cache_bucket_sets)
+        if len(weights) != len(cache_bucket_sets):
+            raise ValueError("cache_mix_weights length must match cache_dirs length")
+        self.weights = [float(weight) for weight in weights]
+        if any(weight < 0 for weight in self.weights) or sum(self.weights) <= 0:
+            raise ValueError("cache_mix_weights must be non-negative and sum to > 0")
+
+        bucket_names = sorted({bucket.name for buckets in cache_bucket_sets for bucket in buckets})
+        self.bucket_groups: list[tuple[str, list[tuple[int, CacheBatchCursor]]]] = []
+        for bucket_name in bucket_names:
+            source_cursors: list[tuple[int, CacheBatchCursor]] = []
+            for source_index, buckets in enumerate(cache_bucket_sets):
+                bucket = next((candidate for candidate in buckets if candidate.name == bucket_name), None)
+                if bucket is None:
+                    continue
+                source_cursors.append(
+                    (
+                        source_index,
+                        CacheBatchCursor(
+                            bucket.files,
+                            batch_size,
+                            shuffle=shuffle,
+                            seed=seed + source_index * 1009 + len(self.bucket_groups),
+                            drop_last=drop_last,
+                        ),
+                    )
+                )
+            if source_cursors:
+                self.bucket_groups.append((bucket_name, source_cursors))
+        if not self.bucket_groups:
+            raise ValueError("no shared cache buckets found across cache dirs")
+        self.position = 0
+        self.order = list(range(len(self.bucket_groups)))
+        if self.shuffle:
+            self.rng.shuffle(self.order)
+
+    def next(self) -> list[Path]:
+        if self.shuffle:
+            group_index = self.rng.randrange(len(self.bucket_groups))
+        else:
+            group_index = self.order[self.position]
+            self.position = (self.position + 1) % len(self.order)
+        _, source_cursors = self.bucket_groups[group_index]
+        source_indices = [source_index for source_index, _ in source_cursors]
+        weights = [self.weights[source_index] for source_index in source_indices]
+        counts = allocate_weighted_counts(self.batch_size, weights)
+        selected: list[Path] = []
+        for count, (_, cursor) in zip(counts, source_cursors):
+            selected.extend(cursor.next_count(count))
+        if self.shuffle:
+            self.rng.shuffle(selected)
+        return selected
 
 
 def prune_checkpoints(output_dir: Path, keep: int | None, *, prediction_type: str = "x") -> None:
@@ -262,12 +357,18 @@ def resolve_max_train_steps(args: argparse.Namespace, cache_sample_count: int) -
     return max(1, math.ceil(steps_per_epoch * args.num_train_epochs))
 
 
-def planned_chunk_train_steps(train_args: argparse.Namespace, chunk_args: argparse.Namespace, plans: list[ChunkPlan]) -> int:
+def planned_chunk_train_steps(
+    train_args: argparse.Namespace,
+    chunk_args: argparse.Namespace,
+    plans: list[ChunkPlan],
+    *,
+    cache_multiplier: int = 1,
+) -> int:
     if chunk_args.train_steps_per_chunk is not None:
         return chunk_args.train_steps_per_chunk * len(plans)
     if train_args.max_train_steps is not None:
         return train_args.max_train_steps * len(plans)
-    return sum(resolve_max_train_steps(train_args, plan.num_samples) for plan in plans)
+    return sum(resolve_max_train_steps(train_args, plan.num_samples * cache_multiplier) for plan in plans)
 
 
 def enable_model_gradient_checkpointing(student: torch.nn.Module, args: argparse.Namespace) -> None:
@@ -437,6 +538,9 @@ def update_chunk_manifest(path: Path, plan: ChunkPlan, **values) -> None:
             "num_samples": plan.num_samples,
         }
         chunks.append(existing)
+    else:
+        existing["start_index"] = plan.start_index
+        existing["num_samples"] = plan.num_samples
     existing.update(values)
     write_chunk_manifest(path, manifest)
 
@@ -476,6 +580,41 @@ def resolve_chunk_student_init(args: argparse.Namespace, previous_checkpoint: st
 
 def resolve_chunk_optimizer_state(args: argparse.Namespace, previous_optimizer_state: str | None) -> str | None:
     return previous_optimizer_state or getattr(args, "optimizer_state", None)
+
+
+def normalize_prompt_sets(args: argparse.Namespace) -> list[dict] | None:
+    prompt_sets = getattr(args, "prompt_sets", None)
+    if not prompt_sets:
+        return None
+    if not isinstance(prompt_sets, list):
+        raise ValueError("prompt_sets must be a list of tables")
+    normalized: list[dict] = []
+    for index, prompt_set in enumerate(prompt_sets):
+        if not isinstance(prompt_set, dict):
+            raise ValueError("each prompt_sets entry must be a table")
+        prompts = prompt_set.get("prompts")
+        cache_dir = prompt_set.get("cache_dir")
+        if not prompts or not cache_dir:
+            raise ValueError(f"prompt_sets[{index}] requires prompts and cache_dir")
+        normalized.append(
+            {
+                "name": prompt_set.get("name") or f"set-{index}",
+                "prompts": prompts,
+                "cache_dir": cache_dir,
+                "start_index": int(prompt_set.get("start_index", getattr(args, "start_index", 0))),
+                "num_samples": prompt_set.get("num_samples", getattr(args, "num_samples", None)),
+                "cache_chunk_offset": int(prompt_set.get("cache_chunk_offset", 0)),
+            }
+        )
+    return normalized
+
+
+def prompt_set_chunk_name(prompt_set: dict, training_chunk_id: int) -> str:
+    return f"chunk-{training_chunk_id + int(prompt_set.get('cache_chunk_offset', 0)):04d}"
+
+
+def chunk_cache_dirs_for_prompt_sets(prompt_sets: list[dict], training_chunk_id: int) -> list[str]:
+    return [str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, training_chunk_id)) for prompt_set in prompt_sets]
 
 
 def make_stage_args(config_path: str, command: str) -> argparse.Namespace:
@@ -594,6 +733,23 @@ def sample_from_training_student(
 
 
 def build_cache(args: argparse.Namespace) -> None:
+    prompt_sets = normalize_prompt_sets(args)
+    if prompt_sets is not None:
+        for prompt_set in prompt_sets:
+            set_args = argparse.Namespace(**vars(args))
+            set_args.prompt_sets = None
+            set_args.prompts = prompt_set["prompts"]
+            set_args.cache_dir = prompt_set["cache_dir"]
+            set_args.start_index = prompt_set["start_index"]
+            set_args.num_samples = prompt_set["num_samples"]
+            print(
+                f"building prompt set {prompt_set['name']}: "
+                f"prompts={set_args.prompts} cache_dir={set_args.cache_dir} "
+                f"start_index={set_args.start_index} num_samples={set_args.num_samples}"
+            )
+            build_cache(set_args)
+        return
+
     device = torch.device(args.device)
     dtype = dtype_from_name(args.mixed_precision)
     all_prompts = read_prompts(args.prompts, None)
@@ -718,7 +874,10 @@ def chunked_rum(args: argparse.Namespace) -> None:
     }
     global_step_offset = 0
     base_train_args = make_stage_args(args.config, "train_xpred")
-    planned_total_train_steps = planned_chunk_train_steps(base_train_args, args, plans)
+    base_cache_args = make_stage_args(args.config, "build_cache")
+    prompt_sets = normalize_prompt_sets(base_cache_args)
+    cache_multiplier = len(prompt_sets) if prompt_sets is not None else 1
+    planned_total_train_steps = planned_chunk_train_steps(base_train_args, args, plans, cache_multiplier=cache_multiplier)
 
     print(
         f"chunked_rum: {len(plans)} planned chunk(s), chunk_size={args.chunk_size}, "
@@ -742,17 +901,40 @@ def chunked_rum(args: argparse.Namespace) -> None:
             continue
 
         cache_args = make_stage_args(args.config, "build_cache")
-        cache_args.cache_dir = str(chunk_cache_dir)
-        cache_args.start_index = plan.start_index
-        cache_args.num_samples = plan.num_samples
-        update_chunk_manifest(manifest_path, plan, status="building_cache", cache_dir=str(chunk_cache_dir))
+        cache_prompt_sets = normalize_prompt_sets(cache_args)
+        if cache_prompt_sets is None:
+            cache_args.cache_dir = str(chunk_cache_dir)
+            cache_args.start_index = plan.start_index
+            cache_args.num_samples = plan.num_samples
+            cache_dirs = [str(chunk_cache_dir)]
+            manifest_cache_value: str | list[str] = str(chunk_cache_dir)
+        else:
+            adjusted_sets = []
+            for prompt_set in cache_prompt_sets:
+                adjusted = dict(prompt_set)
+                adjusted["cache_dir"] = str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, plan.chunk_id))
+                adjusted["start_index"] = int(prompt_set["start_index"]) + (plan.start_index - args.start_index)
+                adjusted["num_samples"] = plan.num_samples
+                adjusted["cache_chunk_offset"] = 0
+                adjusted_sets.append(adjusted)
+            cache_args.prompt_sets = adjusted_sets
+            cache_dirs = [str(Path(prompt_set["cache_dir"])) for prompt_set in adjusted_sets]
+            manifest_cache_value = cache_dirs
+        update_chunk_manifest(manifest_path, plan, status="building_cache", cache_dir=manifest_cache_value)
         print(f"{chunk_name}: building cache start_index={plan.start_index} num_samples={plan.num_samples}")
         build_cache(cache_args)
         release_cuda_memory()
-        update_chunk_manifest(manifest_path, plan, status="cache_built", cache_dir=str(chunk_cache_dir))
+        update_chunk_manifest(manifest_path, plan, status="cache_built", cache_dir=manifest_cache_value)
 
         train_args = make_stage_args(args.config, "train_xpred")
-        train_args.cache_dir = str(chunk_cache_dir)
+        if len(cache_dirs) == 1:
+            train_args.cache_dir = cache_dirs[0]
+            train_args.cache_dirs = None
+        else:
+            train_args.cache_dir = None
+            train_args.cache_dirs = cache_dirs
+            if getattr(train_args, "cache_mix_mode", "single") == "single":
+                train_args.cache_mix_mode = "batch_weighted"
         train_args.output_dir = str(chunk_output_dir)
         train_args.student_init = resolve_chunk_student_init(args, previous_checkpoint)
         train_args.optimizer_state = resolve_chunk_optimizer_state(args, previous_optimizer_state)
@@ -763,7 +945,7 @@ def chunked_rum(args: argparse.Namespace) -> None:
             train_args.max_train_steps = args.train_steps_per_chunk
         update_chunk_manifest(manifest_path, plan, status="training", output_dir=str(chunk_output_dir))
         print(
-            f"{chunk_name}: training cache_dir={chunk_cache_dir} "
+            f"{chunk_name}: training cache_dir={cache_dirs if len(cache_dirs) > 1 else cache_dirs[0]} "
             f"student_init={train_args.student_init or '<default>'} "
             f"optimizer_state={train_args.optimizer_state or '<none>'}"
         )
@@ -793,19 +975,27 @@ def chunked_rum(args: argparse.Namespace) -> None:
         )
         global_step_offset += getattr(train_args, "completed_train_steps", 0) or getattr(train_args, "resolved_max_train_steps", 0)
         if args.delete_cache_after_train:
-            shutil.rmtree(chunk_cache_dir, ignore_errors=True)
+            for cache_dir in cache_dirs:
+                shutil.rmtree(cache_dir, ignore_errors=True)
             update_chunk_manifest(manifest_path, plan, cache_deleted=True)
-            print(f"{chunk_name}: deleted cache {chunk_cache_dir}")
+            print(f"{chunk_name}: deleted cache {cache_dirs}")
     print(f"chunked_rum complete; manifest: {manifest_path}")
 
 
 def train_xpred(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     dtype = dtype_from_name(args.mixed_precision)
-    cache_buckets = collect_cache_buckets(args.cache_dir)
-    cache_files = [path for bucket in cache_buckets for path in bucket.files]
+    cache_dirs = list(getattr(args, "cache_dirs", None) or [])
+    if cache_dirs:
+        cache_bucket_sets = [collect_cache_buckets(cache_dir) for cache_dir in cache_dirs]
+        cache_files = [path for buckets in cache_bucket_sets for bucket in buckets for path in bucket.files]
+    else:
+        cache_buckets = collect_cache_buckets(args.cache_dir)
+        cache_bucket_sets = [cache_buckets]
+        cache_files = [path for bucket in cache_buckets for path in bucket.files]
     if not cache_files:
-        raise ValueError(f"no safetensors cache files found in {args.cache_dir}")
+        cache_label = cache_dirs if cache_dirs else args.cache_dir
+        raise ValueError(f"no safetensors cache files found in {cache_label}")
     adapter = None if args.toy_smoke else load_object(args.adapter)(args, device=device, dtype=dtype)
     if args.toy_smoke:
         student = ToyXPredNet().to(device=device, dtype=dtype)
@@ -836,20 +1026,36 @@ def train_xpred(args: argparse.Namespace) -> None:
     generator = torch.Generator(device=device).manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    batch_cursor = CacheBucketBatchCursor(
-        cache_buckets,
-        args.train_batch_size,
-        shuffle=args.shuffle_cache,
-        seed=args.seed,
-        drop_last=args.drop_last,
-    )
+    if cache_dirs:
+        if getattr(args, "cache_mix_mode", "single") == "single":
+            args.cache_mix_mode = "batch_weighted"
+        if getattr(args, "cache_mix_mode", "batch_weighted") != "batch_weighted":
+            raise ValueError("cache_dirs currently require cache_mix_mode='batch_weighted'")
+        batch_cursor = MultiCacheBucketBatchCursor(
+            cache_bucket_sets,
+            args.train_batch_size,
+            weights=getattr(args, "cache_mix_weights", None),
+            shuffle=args.shuffle_cache,
+            seed=args.seed,
+            drop_last=args.drop_last,
+        )
+        cache_bucket_count = sum(len(buckets) for buckets in cache_bucket_sets)
+    else:
+        batch_cursor = CacheBucketBatchCursor(
+            cache_bucket_sets[0],
+            args.train_batch_size,
+            shuffle=args.shuffle_cache,
+            seed=args.seed,
+            drop_last=args.drop_last,
+        )
+        cache_bucket_count = len(cache_bucket_sets[0])
     resolved_max_train_steps = resolve_max_train_steps(args, len(cache_files))
     args.resolved_max_train_steps = resolved_max_train_steps
     if args.max_train_steps is None:
         print(
             "auto max_train_steps="
             f"{resolved_max_train_steps} from cache_samples={len(cache_files)}, "
-            f"cache_buckets={len(cache_buckets)}, "
+            f"cache_buckets={cache_bucket_count}, "
             f"effective_batch_size={args.train_batch_size * args.gradient_accumulation_steps}, "
             f"num_train_epochs={args.num_train_epochs}"
         )
@@ -1118,6 +1324,9 @@ def parse_args() -> argparse.Namespace:
     train = subparsers.add_parser("train_xpred", help="Train student to predict cached clean Anima latents.")
     add_common_args(train)
     train.add_argument("--cache_dir")
+    train.add_argument("--cache_dirs", nargs="*", default=None)
+    train.add_argument("--cache_mix_mode", default="single", choices=["single", "batch_weighted"])
+    train.add_argument("--cache_mix_weights", nargs="*", type=float, default=None)
     train.add_argument("--output_dir")
     train.add_argument("--prediction_type", default="x", choices=["x", "v"])
     train.add_argument("--global_step_offset", type=int, default=0, help=argparse.SUPPRESS)
@@ -1218,10 +1427,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("real Anima build_cache/chunked_rum requires --dit; use --toy_smoke for local smoke tests")
     if not args.toy_smoke and not args.text_encoder:
         parser.error("real Anima runs require --text_encoder; use --toy_smoke for local smoke tests")
-    if args.command == "build_cache" and (not args.prompts or not args.cache_dir):
-        parser.error("build_cache requires prompts and cache_dir")
-    if args.command == "train_xpred" and (not args.cache_dir or not args.output_dir):
-        parser.error("train_xpred requires cache_dir and output_dir")
+    if args.command == "build_cache" and not getattr(args, "prompt_sets", None) and (not args.prompts or not args.cache_dir):
+        parser.error("build_cache requires prompts/cache_dir or prompt_sets")
+    if args.command == "train_xpred" and (not (getattr(args, "cache_dirs", None) or args.cache_dir) or not args.output_dir):
+        parser.error("train_xpred requires cache_dir or cache_dirs, plus output_dir")
+    if args.command == "train_xpred" and getattr(args, "cache_dirs", None):
+        if len(args.cache_dirs) < 2:
+            parser.error("cache_dirs requires at least two directories")
+        if args.cache_mix_mode == "single":
+            args.cache_mix_mode = "batch_weighted"
+        if args.cache_mix_mode != "batch_weighted":
+            parser.error("cache_dirs requires cache_mix_mode='batch_weighted'")
+        if args.cache_mix_weights is not None and len(args.cache_mix_weights) != len(args.cache_dirs):
+            parser.error("cache_mix_weights length must match cache_dirs length")
+        if args.cache_mix_weights is not None and (any(weight < 0 for weight in args.cache_mix_weights) or sum(args.cache_mix_weights) <= 0):
+            parser.error("cache_mix_weights must be non-negative and sum to > 0")
     if args.command == "sample_xpred" and (not args.checkpoint or not args.output):
         parser.error("sample_xpred requires checkpoint and output")
     if hasattr(args, "prediction_type") and args.prediction_type not in {"x", "v"}:

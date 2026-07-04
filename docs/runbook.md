@@ -132,6 +132,28 @@ The concrete bucket list is fixed in code. You do not need to write resolutions 
 
 `train_xpred` and `chunked_rum` discover these bucket subdirectories automatically. Each optimizer micro-batch is read from a single bucket, so different latent shapes are never concatenated in one batch.
 
+Multiple prompt files can be cached into separate directories with `[[build_cache.prompt_sets]]`. In `chunked_rum`, each set receives its own `chunk-XXXX` directory, so identical sample names from different prompt files do not collide:
+
+```toml
+[[build_cache.prompt_sets]]
+name = "tag"
+prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
+cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/tag"
+start_index = 177000
+num_samples = 50000
+cache_chunk_offset = 14
+
+[[build_cache.prompt_sets]]
+name = "short_nl"
+prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
+cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl"
+start_index = 0
+num_samples = 50000
+cache_chunk_offset = 0
+```
+
+`cache_chunk_offset` only changes the cache directory number, not the prompt index. With the example above, training `chunk-0000` reads/writes `tag/chunk-0014` and `short_nl/chunk-0000`; training `chunk-0001` uses `tag/chunk-0015` and `short_nl/chunk-0001`.
+
 ## 5. Rolling Chunked RUM
 
 For large runs where you do not want to cache everything before training, use:
@@ -174,6 +196,8 @@ On resume, completed chunks are skipped and their checkpoint/state paths are use
 
 Set `delete_cache_after_train = true` only when you want to save disk and are comfortable rebuilding a chunk if you need to rerun it. On a single GPU this is sequential, not parallel prefetching.
 
+When `[[build_cache.prompt_sets]]` is enabled, `chunked_rum` trains on all prompt-set cache directories for the current chunk. Automatic step count uses the combined sample count. For example, two cache dirs with 3000 samples each and effective batch size 32 produce `ceil(6000 / 32) = 188` optimizer steps for one epoch.
+
 ## 6. Real X-Pred Training
 
 Edit `[train_xpred]`, then run:
@@ -181,6 +205,20 @@ Edit `[train_xpred]`, then run:
 ```bash
 python scripts/dev/anima_rum_xpred_train.py train_xpred --config configs/anima_xpred.example.toml
 ```
+
+To train directly from multiple existing cache directories, use:
+
+```toml
+[train_xpred]
+cache_dirs = [
+  "/path/to/tag/chunk-0000",
+  "/path/to/short_nl/chunk-0000",
+]
+cache_mix_mode = "batch_weighted"
+cache_mix_weights = [0.5, 0.5]
+```
+
+The trainer draws each micro-batch from one resolution bucket and splits samples across cache directories according to the weights. With `train_batch_size = 8` and weights `[0.5, 0.5]`, each micro-batch contains four samples from each directory when both have the selected bucket.
 
 The student starts from `[common].student_init`; if that is empty, it falls back to `[common].dit`.
 
