@@ -6,7 +6,7 @@ This project is only for the x-pred conversion experiment. It does not keep ordi
 
 ## Mathematical Contract
 
-This project is not the full cross-architecture RUM method from `/root/shared-nvme/RUM`. It does not bridge between different VAE latent spaces, and it does not do `teacher latent -> image -> student latent` conversion. The Anima teacher and student live in the same Anima latent space, so the teacher's final latent can be used directly as the student target.
+It does not bridge between different VAE latent spaces, and it does not do `teacher latent -> image -> student latent` conversion. The Anima teacher and student live in the same Anima latent space, so the teacher's final latent can be used directly as the student target.
 
 The experiment keeps Anima's Rectified Flow sigma convention. In the equations below, `sigma` means the shifted sigma value actually used by the model, sampler, cache metadata, and training loss:
 
