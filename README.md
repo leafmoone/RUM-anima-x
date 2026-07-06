@@ -73,6 +73,22 @@ It is not:
 local teacher vector-field conversion
 ```
 
+## ComfyUI Nodes
+
+The ComfyUI nodes have been moved to a separate repository:
+
+```text
+https://github.com/leafmoone/ComfyUI-RUM-Anima-XPred
+```
+
+They are separate because x-pred checkpoints cannot be sampled with ordinary Anima/FM velocity sampler nodes. The model output is clean latent `x`, so ComfyUI sampling must stay in x-pred mode and only read out:
+
+```text
+v = (z - x_pred) / sigma
+```
+
+as the Euler update direction inside the sampler. A dedicated node package keeps that checkpoint semantics explicit and avoids wiring an x-pred checkpoint into a velocity-prediction workflow by mistake.
+
 
 
 ## Why Train This Way
