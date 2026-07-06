@@ -1,8 +1,110 @@
 # RUM Anima X-Pred
 
-Standalone project for converting an Anima Rectified Flow DiT from latent velocity prediction to clean latent `x` prediction with RUM reflow.
+Standalone project for converting an Anima Rectified Flow DiT from latent velocity prediction to clean latent `x` prediction with teacher-endpoint reflow.
 
 This project is only for the x-pred conversion experiment. It does not keep ordinary Anima LoRA or full-finetune training entrypoints.
+
+## Mathematical Contract
+
+This project is not the full cross-architecture RUM method from `/root/shared-nvme/RUM`. It does not bridge between different VAE latent spaces, and it does not do `teacher latent -> image -> student latent` conversion. The Anima teacher and student live in the same Anima latent space, so the teacher's final latent can be used directly as the student target.
+
+The experiment keeps Anima's Rectified Flow sigma convention. In the equations below, `sigma` means the shifted sigma value actually used by the model, sampler, cache metadata, and training loss:
+
+```text
+z_sigma = (1 - sigma) * x0 + sigma * eps
+v_anima = dz/dsigma = eps - x0
+```
+
+Sampling runs from `sigma=1` to `sigma=0`, so an Euler step is:
+
+```text
+z_next = z + v_anima * (sigma_next - sigma)
+```
+
+The original Anima model predicts velocity. A direct local conversion from a velocity teacher to an x-pred student would query the teacher at each training point:
+
+```text
+v_teacher = teacher_v(z, sigma, cond)
+x_target = z - sigma * v_teacher
+loss = MSE(student_x(z, sigma, cond), x_target)
+```
+
+That would preserve the teacher's local vector field. This project intentionally does something different: it first asks the frozen FM teacher where a sampled noise latent ends up, then trains a new straight reflow path to that endpoint.
+
+For each prompt and seed:
+
+```text
+eps, prompt --Anima FM teacher sampler--> x_teacher
+z = (1 - sigma) * x_teacher + sigma * eps
+x_pred = student_x(z, sigma, cond)
+```
+
+With the default clean x-pred loss:
+
+```text
+loss = MSE(x_pred, x_teacher)
+```
+
+With the JLT-style velocity-readout loss:
+
+```text
+v_pred = (z - x_pred) / max(sigma, loss_eps_floor)
+v_target = (z - x_teacher) / max(sigma, loss_eps_floor)
+loss = MSE(v_pred, v_target)
+```
+
+Since `z = (1 - sigma) * x_teacher + sigma * eps`, the readout target is:
+
+```text
+v_target = eps - x_teacher
+```
+
+So the model output is still clean latent `x`; the JLT loss only changes where the error is measured. It weights x-pred errors approximately by `1 / sigma^2`, which makes the x-pred student behave more like a velocity model after readout.
+
+In short, this is:
+
+```text
+teacher endpoint reflow + x-pred parameterization
+```
+
+It is not:
+
+```text
+local teacher vector-field conversion
+```
+
+and it is not the full RUM cross-latent-space distillation pipeline.
+
+## Why Train This Way
+
+The motivation inherited from RUM/reflow is to avoid using an arbitrary dataset image as the endpoint for a random noise sample. Instead, the trained teacher defines the endpoint that this prompt/noise pair should reach. This gives a consistent pair:
+
+```text
+(eps, x_teacher)
+```
+
+and trains the student on the straight path between them.
+
+For this project, that has two intended benefits:
+
+- It converts an existing Anima FM teacher into an x-pred sampler without requiring original image data.
+- It reflows the teacher's generated endpoint distribution into a simpler straight-line training problem.
+
+The tradeoff is that the teacher only supervises the endpoint. The intermediate training targets come from the straight-line reflow assumption, not from querying the teacher's true local velocity at each `z, sigma`.
+
+Advantages:
+
+- Same latent space: no VAE decode/encode bridge, no cross-space target mismatch.
+- Cacheable endpoints: teacher sampling can be done once and reused.
+- x-pred output: sampling can use clean-latent predictions through `v = (z - x_pred) / sigma`.
+- Reflow target: avoids random dataset endpoint ambiguity for the same prompt/noise pair.
+
+Disadvantages:
+
+- It does not preserve the teacher's original local ODE/vector field.
+- A bad or biased teacher endpoint becomes the new ground truth.
+- Very small `sigma` can make velocity-readout loss numerically aggressive, so `loss_eps_floor` is required.
+- It is not a complete RUM reproduction, because there is no cross-architecture latent-space bridge.
 
 ## Layout
 
@@ -13,15 +115,8 @@ This project is only for the x-pred conversion experiment. It does not keep ordi
 - `configs/anima_vpred_reflow.example.toml` - optional velocity reflow control config using the same cache format.
 - `vendor/sd-scripts/` - copied local Anima/kohya code used by the adapter.
 - `docs/` - formula and project notes.
-- `agent.md` - current handoff notes for future agents.
 - `tests/` - lightweight tests.
 - `data/prompts/sample_prompts.txt` - small prompt file for smoke tests.
-
-## Agent Handoff
-
-If another agent continues this project, start with `agent.md`. It records the active root directory, live experiment config, chunked resume behavior, sampling semantics, upload helper, runtime artifacts, and files that must not be committed.
-
-This repository should be treated as independent from `/root/shared-nvme/RUM`; do not route Anima x-pred commands through scripts from that directory.
 
 ## Config-First Usage
 
@@ -58,42 +153,3 @@ build cache chunk N -> train on chunk N -> use checkpoint/state N for chunk N+1 
 ```
 
 It writes chunk caches under `[chunked_rum].chunk_root/cache/`, chunk checkpoints and optimizer states under `[chunked_rum].chunk_root/train/`, and resume state to `chunk-manifest.json`. Each next chunk inherits both the previous student checkpoint and AdamW optimizer state. This is sequential on one GPU; it does not run teacher cache generation in parallel with student training.
-
-## Toy Smoke
-
-Use the same config path, but set `[common].toy_smoke = true`, `[common].mixed_precision = "fp32"`, and small sizes such as `64x64`.
-
-```bash
-pytest -q
-python scripts/dev/anima_rum_xpred_train.py build_cache --config /path/to/toy-config.toml
-python scripts/dev/anima_rum_xpred_train.py train_xpred --config /path/to/toy-config.toml
-python scripts/dev/anima_rum_xpred_train.py sample_xpred --config /path/to/toy-config.toml
-```
-
-## Real Adapter
-
-The default real adapter is local:
-
-```text
-rum_xpred.adapters.anima_sd_scripts:create_adapter
-```
-
-Real cache build needs these config fields:
-
-```toml
-[common]
-dit = "/path/to/anima-dit.safetensors"
-text_encoder = "/path/to/qwen3-or-qwen3.safetensors"
-
-[build_cache]
-prompts = "/path/to/prompts.txt"
-cache_dir = "/path/to/cache"
-width = 1024
-height = 1024
-```
-
-The adapter uses only files inside this project plus the model paths you set in the config.
-
-See `docs/runbook.md` for the full build-cache, train, and sample command sequence.
-
-`sample_xpred` can optionally decode sampled latents with the Anima/Qwen VAE and log the PNGs to wandb as `sample/images`. Enable `[sample_xpred].decode_sample_images` and `[wandb].wandb_enabled` in the config.
