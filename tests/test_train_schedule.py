@@ -1,9 +1,22 @@
 import argparse
+import sys
+import types
 
 import torch
 
 from anima_rum_xpred import CacheMetadata, load_xpred_cache_sample, save_xpred_cache_sample
-from scripts.dev.anima_rum_xpred_train import build_cache, final_optimizer_state_for_train_args, reflow_loss, resolve_max_train_steps, train_xpred
+import scripts.dev.anima_rum_xpred_train as train_mod
+from scripts.dev.anima_rum_xpred_train import (
+    build_cache,
+    final_optimizer_state_for_train_args,
+    log_sample_images_to_wandb,
+    prepare_memory_for_training_generation,
+    reflow_loss,
+    resolve_max_train_steps,
+    sample_compare_from_training_student,
+    sample_from_training_student,
+    train_xpred,
+)
 
 
 def test_resolve_max_train_steps_from_epochs():
@@ -26,6 +39,16 @@ def test_resolve_max_train_steps_explicit_override_wins():
     )
 
     assert resolve_max_train_steps(args, cache_sample_count=5) == 7
+
+
+def test_prepare_memory_for_training_generation_clears_gradients():
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+    parameter.grad = torch.ones_like(parameter)
+
+    prepare_memory_for_training_generation(optimizer)
+
+    assert parameter.grad is None
 
 
 def test_train_xpred_saves_and_loads_optimizer_state(tmp_path):
@@ -278,3 +301,359 @@ def test_train_xpred_accepts_multiple_cache_dirs(tmp_path):
     assert args.resolved_max_train_steps == 2
     assert args.cache_mix_mode == "batch_weighted"
     assert final_optimizer_state_for_train_args(args).exists()
+
+
+def test_training_sample_uses_total_step_and_logs_images_to_wandb(tmp_path, monkeypatch):
+    class ConstantXStudent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dummy = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, z, sigma):
+            return torch.zeros_like(z)
+
+    class FakeAdapter:
+        def _encode_prompts(self, prompts, *, cfg, anima_model):
+            return torch.zeros(1, 4, 8), torch.ones(1, 4, 8)
+
+        def student_forward_xpred(self, student, z, sigma, text_conditioning, *, guidance_scale=1.0):
+            return student(z, sigma)
+
+        def decode_latents_to_images(self, latents, image_dir, prefix):
+            image_dir.mkdir(parents=True, exist_ok=True)
+            path = image_dir / f"{prefix}-0000.png"
+            path.write_bytes(b"fake image")
+            return [path]
+
+    calls = []
+
+    def fake_log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=None, *, key="sample/images"):
+        calls.append(
+            {
+                "wandb_run": wandb_run,
+                "image_paths": list(image_paths),
+                "prompt": prompt,
+                "step": step,
+                "key": key,
+            }
+        )
+
+    monkeypatch.setattr(train_mod, "log_sample_images_to_wandb", fake_log_sample_images_to_wandb)
+
+    args = argparse.Namespace(
+        toy_smoke=False,
+        prediction_type="x",
+        sample_prompt="preview prompt",
+        prompt=None,
+        sample_width=64,
+        sample_height=64,
+        width=64,
+        height=64,
+        sample_seed=123,
+        seed=1,
+        sample_steps=2,
+        flow_shift=3.0,
+        sample_num_samples=1,
+        sample_eps_floor=1e-4,
+        sample_output_dir=str(tmp_path / "samples"),
+        output_dir=str(tmp_path / "train"),
+        sample_decode_images=True,
+        sample_wandb_log_images=True,
+        sample_image_prefix="preview",
+        global_step_offset=1999,
+    )
+
+    image_paths = sample_from_training_student(
+        student=ConstantXStudent(),
+        adapter=FakeAdapter(),
+        args=args,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        global_step=1,
+        wandb_run="run",
+    )
+
+    assert (tmp_path / "samples" / "latents" / "xpred-step-002000.pt").exists()
+    assert image_paths == [tmp_path / "samples" / "images" / "step-002000" / "preview-0000.png"]
+    assert calls == [
+        {
+            "wandb_run": "run",
+            "image_paths": image_paths,
+            "prompt": "preview prompt",
+            "step": 2000,
+            "key": "sample/images",
+        }
+    ]
+
+
+def test_training_sample_lora_can_use_separate_step_count(tmp_path):
+    class ConstantXStudent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dummy = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, z, sigma):
+            return torch.zeros_like(z)
+
+    class FakeAdapter:
+        def _encode_prompts(self, prompts, *, cfg, anima_model):
+            return torch.zeros(1, 4, 8), torch.ones(1, 4, 8)
+
+        def student_forward_xpred(self, student, z, sigma, text_conditioning, *, guidance_scale=1.0):
+            return student(z, sigma)
+
+        def save_student_xpred(self, student, checkpoint_path):
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_path.write_bytes(b"checkpoint")
+
+        def load_student_xpred(self, init_checkpoint):
+            return ConstantXStudent()
+
+    args = argparse.Namespace(
+        toy_smoke=False,
+        prediction_type="x",
+        sample_prompt="preview prompt",
+        prompt=None,
+        sample_width=64,
+        sample_height=64,
+        width=64,
+        height=64,
+        sample_seed=123,
+        seed=1,
+        sample_steps=2,
+        flow_shift=3.0,
+        sample_num_samples=1,
+        sample_eps_floor=1e-4,
+        sample_output_dir=str(tmp_path / "samples"),
+        output_dir=str(tmp_path / "train"),
+        sample_decode_images=False,
+        sample_wandb_log_images=True,
+        sample_image_prefix="preview",
+        sample_lora="/models/turbo.safetensors",
+        sample_lora_weight=1.0,
+        sample_lora_steps=10,
+        sample_lora_eps_floor=1e-4,
+        teacher_lora=None,
+        teacher_lora_weight=1.0,
+        mixed_precision="fp32",
+        device="cpu",
+        global_step_offset=1999,
+    )
+
+    sample_from_training_student(
+        student=ConstantXStudent(),
+        adapter=FakeAdapter(),
+        args=args,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        global_step=1,
+        wandb_run=None,
+    )
+
+    main_latent = torch.load(tmp_path / "samples" / "latents" / "xpred-step-002000.pt", map_location="cpu")
+    lora_latent = torch.load(tmp_path / "samples" / "latents" / "xpred-lora-step-002000.pt", map_location="cpu")
+
+    assert main_latent["sigmas"].numel() == 3
+    assert lora_latent["sigmas"].numel() == 11
+
+
+def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_path, monkeypatch):
+    class ConstantXStudent(torch.nn.Module):
+        def forward(self, z, sigma):
+            return torch.zeros_like(z)
+
+    class FakeAdapter:
+        def __init__(self):
+            self.teacher = None
+            self.encode_calls = 0
+            self.encode_cfgs = []
+            self.student_conditioning_keys = []
+            self.saved_checkpoint = None
+            self.loaded_checkpoint = None
+            self.loaded_lora = None
+            self.loaded_lora_weight = None
+
+        def _load_teacher(self):
+            raise AssertionError("training student migration compare must not load teacher")
+
+        def _encode_prompts(self, prompts, *, cfg, anima_model):
+            self.encode_calls += 1
+            self.encode_cfgs.append(cfg)
+            return torch.zeros(1, 4, 8), torch.ones(1, 4, 8)
+
+        def student_forward_xpred(self, student, z, sigma, text_conditioning, *, guidance_scale=1.0):
+            self.student_conditioning_keys.append(set(text_conditioning))
+            return student(z, sigma)
+
+        def save_student_xpred(self, student, checkpoint_path):
+            self.saved_checkpoint = checkpoint_path
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_path.write_bytes(b"checkpoint")
+
+        def load_student_xpred(self, init_checkpoint):
+            self.loaded_checkpoint = init_checkpoint
+            self.loaded_lora = getattr(args, "teacher_lora", None)
+            self.loaded_lora_weight = getattr(args, "teacher_lora_weight", None)
+            return ConstantXStudent()
+
+        def decode_latents_to_images(self, latents, image_dir, prefix):
+            image_dir.mkdir(parents=True, exist_ok=True)
+            path = image_dir / f"{prefix}-0000.png"
+            path.write_bytes(b"fake image")
+            return [path]
+
+    calls = []
+
+    def fake_log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=None, *, key="sample/images"):
+        calls.append(
+            {
+                "wandb_run": wandb_run,
+                "image_paths": list(image_paths),
+                "prompt": prompt,
+                "step": step,
+                "key": key,
+            }
+        )
+
+    monkeypatch.setattr(train_mod, "log_sample_images_to_wandb", fake_log_sample_images_to_wandb)
+
+    args = argparse.Namespace(
+        toy_smoke=False,
+        prediction_type="x",
+        prompt=None,
+        dit="/teacher/base.safetensors",
+        teacher_lora=None,
+        teacher_lora_weight=1.0,
+        sample_prompt="fallback prompt",
+        sample_width=None,
+        sample_height=None,
+        width=64,
+        height=64,
+        sample_seed=None,
+        seed=1,
+        output_dir=str(tmp_path / "train"),
+        global_step_offset=1999,
+        flow_shift=3.0,
+        sample_compare_prompt="compare prompt",
+        sample_compare_steps=2,
+            sample_compare_num_samples=2,
+            sample_compare_cfg=1.5,
+            sample_compare_eps_floor=1e-4,
+        sample_compare_width=64,
+        sample_compare_height=64,
+        sample_compare_seed=123,
+        sample_compare_output_dir=str(tmp_path / "compare"),
+        sample_compare_decode_images=True,
+        sample_compare_image_prefix="compare",
+        sample_compare_wandb_log_images=True,
+            sample_compare_lora="/teacher/turbo.safetensors",
+            sample_compare_lora_weight=0.75,
+            sample_compare_lora_cfg=2.5,
+        )
+    adapter = FakeAdapter()
+
+    image_paths = sample_compare_from_training_student(
+        student=ConstantXStudent(),
+        adapter=adapter,
+        args=args,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        global_step=1,
+        wandb_run="run",
+    )
+
+    assert (tmp_path / "compare" / "step-002000" / "compare-latents.pt").exists()
+    assert image_paths == [
+        tmp_path / "compare" / "step-002000" / "images" / "fm" / "compare-fm-0000.png",
+        tmp_path / "compare" / "step-002000" / "images" / "x" / "compare-x-0000.png",
+        tmp_path / "compare" / "step-002000" / "images" / "fm_lora" / "compare-fm_lora-0000.png",
+        tmp_path / "compare" / "step-002000" / "images" / "x_lora" / "compare-x_lora-0000.png",
+    ]
+    assert calls == [
+        {
+            "wandb_run": "run",
+            "image_paths": image_paths,
+            "prompt": "compare prompt",
+            "step": 2000,
+            "key": "sample_compare/images",
+        }
+    ]
+    assert adapter.teacher is None
+    assert adapter.encode_calls == 2
+    assert adapter.encode_cfgs == [1.5, 2.5]
+    assert adapter.saved_checkpoint is not None
+    assert adapter.loaded_checkpoint == str(adapter.saved_checkpoint)
+    assert adapter.loaded_lora == "/teacher/turbo.safetensors"
+    assert adapter.loaded_lora_weight == 0.75
+    assert not adapter.saved_checkpoint.exists()
+    assert adapter.student_conditioning_keys
+    assert all(keys == {"prompt_embeds", "negative_prompt_embeds"} for keys in adapter.student_conditioning_keys)
+
+
+def test_maybe_import_compare_baseline_copies_and_logs_images(tmp_path, monkeypatch):
+    source = tmp_path / "old" / "alpha-0"
+    source.mkdir(parents=True)
+    (source / "baseline-0000.png").write_bytes(b"image")
+    (source / ".ipynb_checkpoints").mkdir()
+    (source / ".ipynb_checkpoints" / "ignored.png").write_bytes(b"ignored")
+    calls = []
+
+    def fake_log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=None, *, key="sample/images"):
+        calls.append(
+            {
+                "wandb_run": wandb_run,
+                "image_paths": list(image_paths),
+                "prompt": prompt,
+                "step": step,
+                "key": key,
+            }
+        )
+
+    monkeypatch.setattr(train_mod, "log_sample_images_to_wandb", fake_log_sample_images_to_wandb)
+    args = argparse.Namespace(
+        output_dir=str(tmp_path / "train"),
+        sample_prompt="prompt",
+        sample_compare_prompt="",
+        sample_compare_baseline_source_dir=str(source),
+        sample_compare_baseline_output_dir=str(tmp_path / "train" / "compare-baseline"),
+        sample_compare_baseline_wandb_log_images=True,
+    )
+
+    copied = train_mod.maybe_import_compare_baseline(args, wandb_run="run")
+    copied_again = train_mod.maybe_import_compare_baseline(args, wandb_run="run")
+
+    assert copied == [tmp_path / "train" / "compare-baseline" / "teacher-baseline-0000.png"]
+    assert copied[0].exists()
+    assert copied_again == []
+    assert calls == [
+        {
+            "wandb_run": "run",
+            "image_paths": copied,
+            "prompt": "prompt",
+            "step": None,
+            "key": "sample_compare/baseline",
+        }
+    ]
+
+
+def test_log_sample_images_to_wandb_omits_stale_explicit_step(tmp_path, monkeypatch):
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"fake image")
+
+    class FakeRun:
+        step = 2201
+
+        def __init__(self):
+            self.calls = []
+
+        def log(self, payload, step=None):
+            self.calls.append((payload, step))
+
+    fake_wandb = types.SimpleNamespace(Image=lambda path, caption=None: {"path": path, "caption": caption})
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    run = FakeRun()
+
+    log_sample_images_to_wandb(run, [image_path], "prompt", step=2170, key="sample_compare/images")
+
+    assert run.calls[0][1] is None
+    assert run.calls[0][0]["sample_compare/step"] == 2170

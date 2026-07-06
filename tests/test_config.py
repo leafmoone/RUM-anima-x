@@ -77,10 +77,38 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
                 "sample_every_steps": 100,
                 "sample_steps": 8,
                 "sample_num_samples": 2,
+                "sample_cfg": 2.5,
                 "sample_eps_floor": 1e-5,
                 "sample_prompt": "preview prompt",
                 "sample_decode_images": True,
                 "sample_wandb_log_images": True,
+                "sample_lora": "/models/sample-lora.safetensors",
+                "sample_lora_weight": 0.8,
+                "sample_lora_steps": 10,
+                "sample_lora_cfg": 3.5,
+                "sample_lora_eps_floor": 1e-4,
+                "sample_compare_every_steps": 200,
+                "sample_compare_prompt": "compare prompt",
+                "sample_compare_steps": 12,
+                "sample_compare_num_samples": 3,
+                "sample_compare_cfg": 4.5,
+                "sample_compare_eps_floor": 1e-4,
+                "sample_compare_width": 768,
+                "sample_compare_height": 1344,
+                "sample_compare_seed": 20260704,
+                "sample_compare_output_dir": "/tmp/compare",
+                "sample_compare_baseline_source_dir": "/tmp/alpha-0",
+                "sample_compare_baseline_output_dir": "/tmp/baseline",
+                "sample_compare_baseline_wandb_log_images": True,
+                "sample_compare_lora": "/models/turbo.safetensors",
+                "sample_compare_lora_weight": 0.25,
+                "sample_compare_lora_cfg": 5.5,
+                "sample_compare_teacher_sanity": True,
+                "sample_compare_teacher_sanity_lora": "/models/sanity-lora.safetensors",
+                "sample_compare_teacher_sanity_lora_weight": 0.6,
+                "sample_compare_decode_images": True,
+                "sample_compare_image_prefix": "compare",
+                "sample_compare_wandb_log_images": True,
                 "num_train_epochs": 2.0,
                 "lr_scheduler": "cosine",
                 "lr_warmup_steps": 10,
@@ -110,10 +138,38 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
     assert args.sample_every_steps == 100
     assert args.sample_steps == 8
     assert args.sample_num_samples == 2
+    assert args.sample_cfg == 2.5
     assert args.sample_eps_floor == 1e-5
     assert args.sample_prompt == "preview prompt"
     assert args.sample_decode_images is True
     assert args.sample_wandb_log_images is True
+    assert args.sample_lora == "/models/sample-lora.safetensors"
+    assert args.sample_lora_weight == 0.8
+    assert args.sample_lora_steps == 10
+    assert args.sample_lora_cfg == 3.5
+    assert args.sample_lora_eps_floor == 1e-4
+    assert args.sample_compare_every_steps == 200
+    assert args.sample_compare_prompt == "compare prompt"
+    assert args.sample_compare_steps == 12
+    assert args.sample_compare_num_samples == 3
+    assert args.sample_compare_cfg == 4.5
+    assert args.sample_compare_eps_floor == 1e-4
+    assert args.sample_compare_width == 768
+    assert args.sample_compare_height == 1344
+    assert args.sample_compare_seed == 20260704
+    assert args.sample_compare_output_dir == "/tmp/compare"
+    assert args.sample_compare_baseline_source_dir == "/tmp/alpha-0"
+    assert args.sample_compare_baseline_output_dir == "/tmp/baseline"
+    assert args.sample_compare_baseline_wandb_log_images is True
+    assert args.sample_compare_lora == "/models/turbo.safetensors"
+    assert args.sample_compare_lora_weight == 0.25
+    assert args.sample_compare_lora_cfg == 5.5
+    assert args.sample_compare_teacher_sanity is True
+    assert args.sample_compare_teacher_sanity_lora == "/models/sanity-lora.safetensors"
+    assert args.sample_compare_teacher_sanity_lora_weight == 0.6
+    assert args.sample_compare_decode_images is True
+    assert args.sample_compare_image_prefix == "compare"
+    assert args.sample_compare_wandb_log_images is True
 
 
 def test_config_loads_v_prediction_type_for_train_and_sample():
@@ -142,6 +198,62 @@ def test_config_loads_v_prediction_type_for_train_and_sample():
 
     assert train_args.prediction_type == "v"
     assert sample_args.prediction_type == "v"
+
+
+def test_config_loads_sample_compare_settings():
+    args = config_to_namespace(
+        {
+            "command": "sample_compare",
+            "common": {"toy_smoke": True},
+            "sample_compare": {
+                "student_checkpoint": "/tmp/student.pt",
+                "teacher_checkpoint": "/tmp/teacher.safetensors",
+                "output_dir": "/tmp/compare",
+                "prompt": "preview",
+                "alphas": [0.0, 0.5, 1.0],
+                "steps": 8,
+                "decode_sample_images": True,
+            },
+        }
+    )
+
+    assert args.command == "sample_compare"
+    assert args.student_checkpoint == "/tmp/student.pt"
+    assert args.teacher_checkpoint == "/tmp/teacher.safetensors"
+    assert args.output_dir == "/tmp/compare"
+    assert args.alphas == [0.0, 0.5, 1.0]
+    assert args.decode_sample_images is True
+
+
+def test_config_inherits_build_cache_teacher_lora_for_compare_paths():
+    config = {
+        "command": "train_xpred",
+        "common": {"toy_smoke": True},
+        "build_cache": {
+            "teacher_lora": "/models/turbo.safetensors",
+            "teacher_lora_weight": 0.75,
+        },
+        "train_xpred": {
+            "cache_dir": "/tmp/cache",
+            "output_dir": "/tmp/train",
+        },
+        "sample_compare": {
+            "student_checkpoint": "/tmp/student.pt",
+            "output_dir": "/tmp/compare",
+        },
+    }
+
+    train_args = config_to_namespace(config, command_override="train_xpred")
+    compare_args = config_to_namespace(config, command_override="sample_compare")
+
+    assert train_args.sample_compare_lora == "/models/turbo.safetensors"
+    assert train_args.sample_compare_lora_weight == 0.75
+    assert train_args.sample_lora == "/models/turbo.safetensors"
+    assert train_args.sample_lora_weight == 0.75
+    assert train_args.sample_compare_teacher_sanity_lora == "/models/turbo.safetensors"
+    assert train_args.sample_compare_teacher_sanity_lora_weight == 0.75
+    assert compare_args.teacher_lora == "/models/turbo.safetensors"
+    assert compare_args.teacher_lora_weight == 0.75
 
 
 def test_config_loads_chunked_rum_settings():
@@ -204,6 +316,27 @@ def test_config_loads_prompt_sets_and_cache_dirs():
     assert train_args.cache_dirs == ["/tmp/tag-cache", "/tmp/nl-cache"]
     assert train_args.cache_mix_mode == "batch_weighted"
     assert train_args.cache_mix_weights == [0.5, 0.5]
+
+
+def test_config_rejects_global_build_cache_keys_inside_prompt_set():
+    config = {
+        "command": "build_cache",
+        "common": {"toy_smoke": True},
+        "build_cache": {
+            "prompt_sets": [
+                {
+                    "name": "bad",
+                    "prompts": "/tmp/prompts.txt",
+                    "cache_dir": "/tmp/cache",
+                    "cache_batch_size": 8,
+                    "bucket_enabled": True,
+                }
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError, match="Move these keys before the first"):
+        config_to_namespace(config, command_override="build_cache")
 
 
 def test_config_rejects_unknown_sections():

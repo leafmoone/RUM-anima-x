@@ -8,12 +8,20 @@ This project is only for the x-pred conversion experiment. It does not keep ordi
 
 - `src/rum_xpred/` - x-pred formula, cache, sampler, and local Anima adapter.
 - `scripts/dev/anima_rum_xpred_train.py` - experiment CLI.
+- `scripts/dev/upload_completed_cache_chunks.py` - project-local cache packaging/upload helper.
 - `configs/anima_xpred.example.toml` - commented config covering cache, train, and sample.
 - `configs/anima_vpred_reflow.example.toml` - optional velocity reflow control config using the same cache format.
 - `vendor/sd-scripts/` - copied local Anima/kohya code used by the adapter.
 - `docs/` - formula and project notes.
+- `agent.md` - current handoff notes for future agents.
 - `tests/` - lightweight tests.
 - `data/prompts/sample_prompts.txt` - small prompt file for smoke tests.
+
+## Agent Handoff
+
+If another agent continues this project, start with `agent.md`. It records the active root directory, live experiment config, chunked resume behavior, sampling semantics, upload helper, runtime artifacts, and files that must not be committed.
+
+This repository should be treated as independent from `/root/shared-nvme/RUM`; do not route Anima x-pred commands through scripts from that directory.
 
 ## Config-First Usage
 
@@ -30,6 +38,8 @@ python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_x
 Without a subcommand, the script uses `command` from the config. With a subcommand, the subcommand selects the stage. The same config can contain `[build_cache]`, `[train_xpred]`, and `[sample_xpred]` sections.
 
 The example config includes the normal experiment controls: cache start index, cache batch size, skip-existing resume behavior, optional built-in resolution bucketing, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, shuffle/drop-last, periodic checkpoints, gradient checkpointing, wandb logging, dry run, and sample count.
+
+In the current workspace, `configs/anima_xpred.example.toml` is also the live experiment config. Inspect it before editing because it contains real paths, W&B run settings, chunk offsets, and sample/compare settings.
 
 Set `[build_cache].bucket_enabled = true` to use the built-in fixed resolution buckets. Cache files are written under `cache_dir/<width>x<height>/`; training discovers those subdirectories automatically and samples each optimizer micro-batch from one bucket so latent shapes do not mix inside a batch.
 

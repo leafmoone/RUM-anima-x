@@ -273,6 +273,39 @@ def sample_with_vpred_student(
     return z
 
 
+@torch.no_grad()
+def sample_with_mixed_velocity(
+    teacher_forward_v: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    student_forward_x: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    eps_latent: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    alpha: float,
+    eps_floor: float = DEFAULT_EPS_FLOOR,
+) -> torch.Tensor:
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("alpha must be in [0, 1]")
+    if sigmas.ndim != 1:
+        raise ValueError("sigmas must be a 1D schedule")
+    if sigmas[-1].item() != 0.0:
+        raise ValueError("sigmas must end at 0")
+    z = eps_latent
+    for index, sigma_value in enumerate(sigmas[:-1]):
+        sigma = sigma_value.reshape(1, 1, 1, 1).to(device=z.device, dtype=z.dtype).expand(z.shape[0], 1, 1, 1)
+        sigma_next = sigmas[index + 1].reshape(1, 1, 1, 1).to(device=z.device, dtype=z.dtype)
+        v_teacher = teacher_forward_v(z, sigma)
+        if alpha == 0.0:
+            v = v_teacher
+        else:
+            x_student = student_forward_x(z, sigma)
+            v_student = xpred_to_anima_v(z, x_student, sigma, eps_floor)
+            v = (1.0 - alpha) * v_teacher + alpha * v_student
+        z = anima_euler_step(z, v, sigma, sigma_next)
+        if not torch.isfinite(z).all():
+            raise FloatingPointError("non-finite latent during mixed-velocity sampling")
+    return z
+
+
 def cache_file_sort_key(path: Path) -> tuple[int, str]:
     stem_digits = "".join(ch for ch in path.stem if ch.isdigit())
     return (int(stem_digits) if stem_digits else math.inf, path.name)

@@ -4,6 +4,7 @@
 #   python scripts/dev/anima_rum_xpred_train.py build_cache  --config configs/anima_xpred.example.toml
 #   python scripts/dev/anima_rum_xpred_train.py train_xpred  --config configs/anima_xpred.example.toml
 #   python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/anima_xpred.example.toml
+#   python scripts/dev/anima_rum_xpred_train.py sample_compare --config configs/anima_xpred.example.toml
 #   python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
 #
 # 不写 subcommand 时执行下面的 command；写 subcommand 时以 CLI subcommand 为准。
@@ -24,15 +25,16 @@ command = "chunked_rum"
 # rolling cache、分段训练输出和 manifest 的根目录。
 chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks"
 
-# 总共处理多少条 prompt。比如 30000 表示从 start_index 开始处理 30000 条。
-total_samples =108000
+# 不使用 build_cache.prompt_sets 时，才需要显式设置 start_index/total_samples。
+# 使用 prompt_sets 时，chunked_rum 会按各 set 的 start_index/num_samples 自动推导 chunk 计划。
+# total_samples = 30000
 
 # 每次 cache 一段多少样本，然后用这一段训练。
 # 数值越大，cache 占盘越多；越小，切换 teacher/student 的频率越高。
 chunk_size = 3000
 
-# 第一段从 prompt 文件的哪个 index 开始。
-start_index = 69000
+# 第一段从 prompt 文件的哪个 index 开始；仅用于非 prompt_sets 模式。
+# start_index = 69000
 
 # 可选：只跑前 N 个 chunk，适合 smoke 或中断调试；删除表示一直跑完 total_samples。
 # max_chunks = 1
@@ -132,27 +134,6 @@ prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
 # teacher endpoint cache 输出目录。turbo LoRA cache 不要和 base 30-step cache 混用。
 cache_dir = "/root/shared-nvme/cache_data/150000"
 
-# 可选：多 prompt set 构建。启用时会忽略上面的 prompts/cache_dir/start_index/num_samples，
-# 每个 set 写入自己的 cache_dir，允许不同 prompt 文件从 sample-000000 开始而不重名。
-# chunked_rum 下会自动在每个 cache_dir 后追加 chunk-XXXX。
-#
-# [[build_cache.prompt_sets]]
-# name = "tag"
-# prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
-# cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/tag"
-# start_index = 177000
-# num_samples = 50000
-# 可选：训练 chunk-0000 对应这个 set 的 cache/chunk-0014，chunk-0001 对应 chunk-0015。
-# 适合复用已经从 chunk-0014 开始整理好的 tag cache。
-# cache_chunk_offset = 14
-#
-# [[build_cache.prompt_sets]]
-# name = "short_nl"
-# prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
-# cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl"
-# start_index = 0
-# num_samples = 50000
-# cache_chunk_offset = 0
 
 # 只读取前 N 条 prompt；null 表示读取全部。
 num_samples = 300000
@@ -187,6 +168,57 @@ teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
 
 # teacher LoRA 权重。
 teacher_lora_weight = 1.0
+
+# 可选：多 prompt set 构建。启用时会忽略上面的 prompts/cache_dir/start_index/num_samples，
+# 每个 set 写入自己的 cache_dir，允许不同 prompt 文件从 sample-000000 开始而不重名。
+# chunked_rum 下会自动在每个 cache_dir 后追加 chunk-XXXX。
+#
+# [[build_cache.prompt_sets]]
+# name = "multicap_mix_30k"
+# prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts_anime_multicap_mix_30k.txt"
+# cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/multicap_mix_30k"
+# start_index = 0
+# num_samples = 30000
+# repeat 只增加等效训练长度；第一轮之后会复用/链接已有 cache，不会重新跑教师生成。
+# repeat = 1
+# cache_chunk_offset = 0
+
+[[build_cache.prompt_sets]]
+name = "short_nl"
+prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
+cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl"
+start_index = 0
+num_samples = 50000
+repeat = 1
+cache_chunk_offset = 0
+
+
+[[build_cache.prompt_sets]]
+name = "long_names_10k"
+prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_long_names_10k.txt"
+cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/long_names_10k"
+start_index = 0
+num_samples = 10000
+repeat = 5
+cache_chunk_offset = 0
+
+[[build_cache.prompt_sets]]
+name = "long_no_names_10k"
+prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_long_no_names_10k.txt"
+cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/long_no_names_10k"
+start_index = 0
+num_samples = 10000
+repeat = 5
+cache_chunk_offset = 0
+
+[[build_cache.prompt_sets]]
+name = "min_individual_json_flat_10k"
+prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_min_individual_json_flat_10k.txt"
+cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/min_individual_json_flat_10k"
+start_index = 0
+num_samples = 10000
+repeat = 5
+cache_chunk_offset = 0
 
 [train_xpred]
 # build_cache 输出的 safetensors cache 目录。
@@ -294,7 +326,9 @@ sample_prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua
 
 # 训练中 sample 的步数、数量、尺寸。sample_width/height 删除或注释时默认使用训练尺寸。
 sample_steps = 30
-sample_num_samples = 2
+sample_num_samples = 4
+# 不加 LoRA 的普通 sample CFG。1.0 表示无 CFG 双分支。
+sample_cfg = 4.0
 sample_eps_floor = 1e-4
 # sample_width = 1024
 # sample_height = 1024
@@ -309,6 +343,58 @@ sample_eps_floor = 1e-4
 sample_decode_images = true
 sample_image_prefix = "xpred-train-sample"
 sample_wandb_log_images = true
+
+# 普通训练 sample 的 LoRA 分支；"__inherit__" 表示继承 [build_cache].teacher_lora。
+# 会额外保存/上传一组 sample-lora 图，用来检查加速 LoRA 对当前 x-pred student 的影响。
+sample_lora = "__inherit__"
+sample_lora_weight = 1.0
+sample_lora_steps = 10
+# 加 LoRA 分支的 sample CFG。删除或设为 null 时继承 sample_cfg。
+sample_lora_cfg = 1.0
+sample_lora_eps_floor = 1e-4
+
+# 训练中自动 sample_compare。0 表示关闭；开启后用同一个当前 student 生成：
+#   fm：把当前输出当 FM/v 预测采样
+#   x：把当前输出当 clean latent x 预测采样
+#   fm_lora / x_lora：在当前 student 临时叠加 sample_compare_lora 后分别采样
+sample_compare_every_steps = 0
+
+# 训练中 sample_compare prompt；留空时复用 sample_prompt。
+sample_compare_prompt = ''
+
+# 训练中 sample_compare 的步数、数量、尺寸。宽高留空时依次复用 sample_width/height 或训练尺寸。
+sample_compare_steps = 10
+sample_compare_num_samples = 2
+# sample_compare 中 fm/x 两个非 LoRA 分支的 CFG。
+sample_compare_cfg = 1.0
+sample_compare_eps_floor = 1e-4
+# sample_compare_width = 1024
+# sample_compare_height = 1024
+# sample_compare_seed = 20260701
+
+# 可选：把已经生成的 teacher/alpha-0 基准图移动到 compare-baseline，并上传 wandb。
+# 只会在本次进程第一次训练中 compare 时导入一次。
+sample_compare_baseline_source_dir = "/root/shared-nvme/RUM-anima-xpred/compare-baseline"
+sample_compare_baseline_output_dir = "/root/shared-nvme/RUM-anima-xpred/compare-baseline"
+sample_compare_baseline_wandb_log_images = true
+
+# 训练中 compare 的 LoRA 分支；"__inherit__" 表示继承 [build_cache].teacher_lora。
+# 设为 "" 可只生成 fm/x 两张，不生成 fm_lora/x_lora。
+sample_compare_lora = "__inherit__"
+sample_compare_lora_weight = 1.0
+# sample_compare 中 fm_lora/x_lora 两个 LoRA 分支的 CFG。删除或设为 null 时继承 sample_compare_cfg。
+sample_compare_lora_cfg = 1.0
+
+# 可选 sanity：同一 prompt/noise/steps 下跑 teacher，确认 schedule/LoRA 本身能正常出图。
+sample_compare_teacher_sanity = true
+sample_compare_teacher_sanity_lora = "__inherit__"
+sample_compare_teacher_sanity_lora_weight = 1.0
+
+# 输出目录留空时写到 output_dir/train-compare-samples/step-XXXXXX。
+# sample_compare_output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/train-compare-samples"
+sample_compare_decode_images = true
+sample_compare_image_prefix = "compare-train"
+sample_compare_wandb_log_images = true
 
 # true 时只跑一个 optimizer step、打印统计，不保存 checkpoint。
 dry_run = false
@@ -346,4 +432,22 @@ sample_image_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/sample-i
 sample_image_prefix = "xpred-sample"
 
 # wandb_enabled=true 且 decode_sample_images=true 时，将 PNG 作为 wandb.Image 记录到 sample/images。
+wandb_log_sample_images = true
+
+[sample_compare]
+# Debug 对比采样：alpha=0 是 teacher/FM velocity，alpha=1 是 student x-pred 转 velocity。
+student_checkpoint = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/xpred-adapter-checkpoint.safetensors"
+teacher_checkpoint = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks"
+prediction_type = "x"
+prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
+num_samples = 2
+steps = 30
+width = 1024
+height = 1024
+eps_floor = 1e-4
+alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+teacher_cfg = 1.0
+decode_sample_images = true
+sample_image_prefix = "compare"
 wandb_log_sample_images = true

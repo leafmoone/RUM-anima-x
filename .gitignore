@@ -27,6 +27,7 @@ watch_upload_completed_cache_chunks.sh
 # Logs and experiment trackers
 logs/
 wandb/
+compare-baseline/
 
 # Generated outputs
 outputs/
@@ -63,3 +64,4 @@ configs/generated_qat_chunks/
 
 # Local datasets or scratch assets
 image_balance_2024_webp/
+2605.27102v2.pdf

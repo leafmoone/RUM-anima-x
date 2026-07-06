@@ -15,7 +15,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
             return _toml.loads(text)
 
 
-COMMANDS = {"build_cache", "train_xpred", "sample_xpred", "chunked_rum"}
+COMMANDS = {"build_cache", "train_xpred", "sample_xpred", "sample_compare", "chunked_rum"}
+PROMPT_SET_KEYS = {"name", "prompts", "cache_dir", "start_index", "num_samples", "cache_chunk_offset", "repeat"}
 
 COMMON_DEFAULTS: dict[str, Any] = {
     "device": None,
@@ -95,6 +96,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "sample_prompt": "",
         "sample_steps": 40,
         "sample_num_samples": 1,
+        "sample_cfg": 1.0,
         "sample_eps_floor": 1e-4,
         "sample_width": None,
         "sample_height": None,
@@ -103,6 +105,33 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "sample_decode_images": False,
         "sample_image_prefix": "train-sample",
         "sample_wandb_log_images": True,
+        "sample_lora": "__inherit__",
+        "sample_lora_weight": None,
+        "sample_lora_steps": None,
+        "sample_lora_cfg": None,
+        "sample_lora_eps_floor": None,
+        "sample_compare_every_steps": 0,
+        "sample_compare_prompt": "",
+        "sample_compare_steps": 40,
+        "sample_compare_num_samples": 1,
+        "sample_compare_cfg": 1.0,
+        "sample_compare_eps_floor": 1e-4,
+        "sample_compare_width": None,
+        "sample_compare_height": None,
+        "sample_compare_seed": None,
+        "sample_compare_output_dir": None,
+        "sample_compare_baseline_source_dir": None,
+        "sample_compare_baseline_output_dir": None,
+        "sample_compare_baseline_wandb_log_images": True,
+        "sample_compare_lora": "__inherit__",
+        "sample_compare_lora_weight": None,
+        "sample_compare_lora_cfg": None,
+        "sample_compare_teacher_sanity": False,
+        "sample_compare_teacher_sanity_lora": "__inherit__",
+        "sample_compare_teacher_sanity_lora_weight": None,
+        "sample_compare_decode_images": False,
+        "sample_compare_image_prefix": "compare",
+        "sample_compare_wandb_log_images": True,
         "dry_run": False,
     },
     "sample_xpred": {
@@ -118,6 +147,25 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "decode_sample_images": False,
         "sample_image_dir": None,
         "sample_image_prefix": "sample",
+        "wandb_log_sample_images": True,
+    },
+    "sample_compare": {
+        "student_checkpoint": None,
+        "teacher_checkpoint": None,
+        "teacher_lora": "__inherit__",
+        "teacher_lora_weight": None,
+        "output_dir": None,
+        "prediction_type": "x",
+        "prompt": "",
+        "num_samples": 1,
+        "steps": 40,
+        "width": 1024,
+        "height": 1024,
+        "eps_floor": 1e-4,
+        "alphas": [0.0, 0.25, 0.5, 0.75, 1.0],
+        "teacher_cfg": 1.0,
+        "decode_sample_images": False,
+        "sample_image_prefix": "compare",
         "wandb_log_sample_images": True,
     },
     "chunked_rum": {
@@ -176,6 +224,37 @@ def config_to_namespace(config: dict[str, Any], *, command_override: str | None 
     common.update(_section(config, "common"))
     command_values = dict(COMMAND_DEFAULTS[command])
     command_values.update(_section(config, command))
+    if command == "build_cache" and isinstance(command_values.get("prompt_sets"), list):
+        build_cache_global_keys = set(COMMAND_DEFAULTS["build_cache"]) - {"prompt_sets", *PROMPT_SET_KEYS}
+        for index, prompt_set in enumerate(command_values["prompt_sets"]):
+            if not isinstance(prompt_set, dict):
+                continue
+            misplaced = sorted(set(prompt_set) & build_cache_global_keys)
+            if misplaced:
+                raise ValueError(
+                    "build_cache.prompt_sets entries contain global build_cache key(s): "
+                    f"prompt_sets[{index}] has {', '.join(misplaced)}. "
+                    "Move these keys before the first [[build_cache.prompt_sets]] table."
+                )
+    build_cache_values = _section(config, "build_cache")
+    if command == "train_xpred":
+        if command_values.get("sample_compare_lora") == "__inherit__":
+            command_values["sample_compare_lora"] = build_cache_values.get("teacher_lora")
+        if command_values.get("sample_compare_lora_weight") is None:
+            command_values["sample_compare_lora_weight"] = build_cache_values.get("teacher_lora_weight", 1.0)
+        if command_values.get("sample_lora") == "__inherit__":
+            command_values["sample_lora"] = build_cache_values.get("teacher_lora")
+        if command_values.get("sample_lora_weight") is None:
+            command_values["sample_lora_weight"] = build_cache_values.get("teacher_lora_weight", 1.0)
+        if command_values.get("sample_compare_teacher_sanity_lora") == "__inherit__":
+            command_values["sample_compare_teacher_sanity_lora"] = build_cache_values.get("teacher_lora")
+        if command_values.get("sample_compare_teacher_sanity_lora_weight") is None:
+            command_values["sample_compare_teacher_sanity_lora_weight"] = build_cache_values.get("teacher_lora_weight", 1.0)
+    elif command == "sample_compare":
+        if command_values.get("teacher_lora") == "__inherit__":
+            command_values["teacher_lora"] = build_cache_values.get("teacher_lora")
+        if command_values.get("teacher_lora_weight") is None:
+            command_values["teacher_lora_weight"] = build_cache_values.get("teacher_lora_weight", 1.0)
     wandb_values = dict(WANDB_DEFAULTS)
     wandb_values.update(_section(config, "wandb"))
 

@@ -187,7 +187,7 @@ class AnimaSdScriptsAdapter:
         missing_positions: list[int] = []
         for position, prompt in enumerate(prompts):
             cached = self.conds_cache.get(prompt)
-            if cached is None:
+            if not isinstance(cached, torch.Tensor):
                 cond_embeddings.append(None)
                 missing_prompts.append(prompt)
                 missing_positions.append(position)
@@ -320,11 +320,16 @@ class AnimaSdScriptsAdapter:
         z: torch.Tensor,
         sigma: torch.Tensor,
         text_conditioning: dict[str, torch.Tensor],
+        *,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         if "prompt_embeds" not in text_conditioning:
             prompt = getattr(self.args, "prompt", "")
-            context, _context_null = self._encode_prompt(prompt, cfg=1.0, anima_model=student)
-            text_conditioning = {"prompt_embeds": context["embed"][0].detach().to(dtype=self.dtype)}
+            context, context_null = self._encode_prompt(prompt, cfg=guidance_scale, anima_model=student)
+            text_conditioning = {
+                "prompt_embeds": context["embed"][0].detach().to(dtype=self.dtype),
+                "negative_prompt_embeds": context_null["embed"][0].detach().to(dtype=self.dtype),
+            }
         if z.ndim == 4:
             model_z = z.unsqueeze(2)
         else:
@@ -344,6 +349,63 @@ class AnimaSdScriptsAdapter:
         )
         timestep = sigma.reshape(sigma.shape[0], -1)[:, 0].to(self.device, dtype=torch.bfloat16)
         out = student(model_z.to(self.device, dtype=torch.bfloat16), timestep, embed, padding_mask=padding_mask)
+        if guidance_scale != 1.0:
+            uncond_embed = text_conditioning.get("negative_prompt_embeds")
+            if uncond_embed is None:
+                _context, context_null = self._encode_prompt(getattr(self.args, "prompt", ""), cfg=guidance_scale, anima_model=student)
+                uncond_embed = context_null["embed"][0].detach().to(dtype=self.dtype)
+            uncond_embed = uncond_embed.to(self.device, dtype=torch.bfloat16)
+            if uncond_embed.shape[0] == 1 and model_z.shape[0] > 1:
+                uncond_embed = uncond_embed.expand(model_z.shape[0], *uncond_embed.shape[1:]).contiguous()
+            if uncond_embed.shape[0] != model_z.shape[0]:
+                raise ValueError(f"negative prompt embed batch size {uncond_embed.shape[0]} != latent batch size {model_z.shape[0]}")
+            uncond = student(model_z.to(self.device, dtype=torch.bfloat16), timestep, uncond_embed, padding_mask=padding_mask)
+            out = uncond + guidance_scale * (out - uncond)
+        return out.squeeze(2).to(dtype=z.dtype)
+
+    def teacher_forward_vpred(
+        self,
+        teacher: torch.nn.Module,
+        z: torch.Tensor,
+        sigma: torch.Tensor,
+        text_conditioning: dict[str, torch.Tensor],
+        *,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
+        if "prompt_embeds" not in text_conditioning:
+            prompt = getattr(self.args, "prompt", "")
+            context, context_null = self._encode_prompt(prompt, cfg=guidance_scale, anima_model=teacher)
+            text_conditioning = {
+                "prompt_embeds": context["embed"][0].detach().to(dtype=self.dtype),
+                "negative_prompt_embeds": context_null["embed"][0].detach().to(dtype=self.dtype),
+            }
+        if z.ndim == 4:
+            model_z = z.unsqueeze(2)
+        else:
+            model_z = z
+        embed = text_conditioning["prompt_embeds"].to(self.device, dtype=torch.bfloat16)
+        if embed.shape[0] == 1 and model_z.shape[0] > 1:
+            embed = embed.expand(model_z.shape[0], *embed.shape[1:]).contiguous()
+        padding_mask = torch.zeros(
+            model_z.shape[0],
+            1,
+            model_z.shape[-2],
+            model_z.shape[-1],
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        timestep = sigma.reshape(sigma.shape[0], -1)[:, 0].to(self.device, dtype=torch.bfloat16)
+        out = teacher(model_z.to(self.device, dtype=torch.bfloat16), timestep, embed, padding_mask=padding_mask)
+        if guidance_scale != 1.0:
+            uncond_embed = text_conditioning.get("negative_prompt_embeds")
+            if uncond_embed is None:
+                _context, context_null = self._encode_prompt(getattr(self.args, "prompt", ""), cfg=guidance_scale, anima_model=teacher)
+                uncond_embed = context_null["embed"][0].detach().to(dtype=self.dtype)
+            uncond_embed = uncond_embed.to(self.device, dtype=torch.bfloat16)
+            if uncond_embed.shape[0] == 1 and model_z.shape[0] > 1:
+                uncond_embed = uncond_embed.expand(model_z.shape[0], *uncond_embed.shape[1:]).contiguous()
+            uncond = teacher(model_z.to(self.device, dtype=torch.bfloat16), timestep, uncond_embed, padding_mask=padding_mask)
+            out = uncond + guidance_scale * (out - uncond)
         return out.squeeze(2).to(dtype=z.dtype)
 
     def save_student_xpred(self, student: torch.nn.Module, checkpoint_path: str | Path) -> None:

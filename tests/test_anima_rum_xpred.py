@@ -9,6 +9,7 @@ from anima_rum_xpred import (
     reflow_latent_z,
     reflow_training_target,
     sample_train_sigmas,
+    sample_with_mixed_velocity,
     sample_with_vpred_student,
     sample_with_xpred_student,
     save_xpred_cache_sample,
@@ -167,6 +168,39 @@ def test_vpred_sampler_moves_directly_with_predicted_velocity():
     out = sample_with_vpred_student(student, eps, sigmas)
 
     assert student.calls == 2
+    torch.testing.assert_close(out, torch.full_like(eps, 2.0))
+
+
+def test_mixed_velocity_sampler_alpha_extremes_match_teacher_and_student_paths():
+    eps = torch.full((1, 16, 1, 1), 5.0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+
+    def teacher_forward(z, sigma):
+        return torch.full_like(z, 3.0)
+
+    def student_forward_x(z, sigma):
+        return torch.full_like(z, 2.0)
+
+    teacher_out = sample_with_mixed_velocity(teacher_forward, student_forward_x, eps, sigmas, alpha=0.0)
+    student_out = sample_with_mixed_velocity(teacher_forward, student_forward_x, eps, sigmas, alpha=1.0)
+    xpred_out = sample_with_xpred_student(student_forward_x, eps, sigmas)
+
+    torch.testing.assert_close(teacher_out, torch.full_like(eps, 2.0))
+    torch.testing.assert_close(student_out, xpred_out)
+
+
+def test_mixed_velocity_sampler_alpha_zero_does_not_call_student():
+    eps = torch.full((1, 16, 1, 1), 5.0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+
+    def teacher_forward(z, sigma):
+        return torch.full_like(z, 3.0)
+
+    def student_forward_x(z, sigma):
+        raise AssertionError("alpha=0 must not call student")
+
+    out = sample_with_mixed_velocity(teacher_forward, student_forward_x, eps, sigmas, alpha=0.0)
+
     torch.testing.assert_close(out, torch.full_like(eps, 2.0))
 
 

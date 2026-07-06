@@ -6,7 +6,9 @@ import dataclasses
 import gc
 import json
 import math
+import os
 import random
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -36,6 +38,7 @@ from rum_xpred.anima import (
     make_toy_teacher_endpoint,
     reflow_training_target,
     sample_train_sigmas,
+    sample_with_mixed_velocity,
     sample_with_vpred_student,
     sample_with_xpred_student,
     save_xpred_cache_sample,
@@ -167,6 +170,109 @@ def merge_cache_samples(paths: list[Path], device: torch.device, dtype: torch.dt
             for key in text_keys
         },
     }
+
+
+def cache_source_name(cache_dir: str | Path) -> str:
+    path = Path(cache_dir)
+    name = path.parent.name if path.name.startswith("chunk-") and path.parent.name else path.name
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in name)
+    return safe or "cache"
+
+
+def unique_cache_source_names(cache_dirs: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    names: list[str] = []
+    for cache_dir in cache_dirs:
+        base = cache_source_name(cache_dir)
+        count = counts.get(base, 0)
+        counts[base] = count + 1
+        names.append(base if count == 0 else f"{base}_{count + 1}")
+    return names
+
+
+def cache_source_indices_for_paths(paths: list[Path], cache_dirs: list[str]) -> list[int]:
+    roots = [Path(cache_dir).resolve() for cache_dir in cache_dirs]
+    indices: list[int] = []
+    for path in paths:
+        resolved = path.resolve()
+        for index, root in enumerate(roots):
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            indices.append(index)
+            break
+        else:
+            raise ValueError(f"cache sample path does not belong to any cache_dir: {path}")
+    return indices
+
+
+@torch.no_grad()
+def loss_by_cache_source(
+    *,
+    prediction_type: str,
+    loss_weighting: str,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    z: torch.Tensor,
+    sigma: torch.Tensor,
+    eps_floor: float,
+    source_indices: list[int],
+    source_count: int,
+) -> dict[int, float]:
+    losses: dict[int, float] = {}
+    if not source_indices:
+        return losses
+    source_tensor = torch.tensor(source_indices, device=prediction.device)
+    for source_index in range(source_count):
+        mask = source_tensor == source_index
+        if not bool(mask.any()):
+            continue
+        losses[source_index] = float(
+            reflow_loss(
+                prediction_type,
+                loss_weighting,
+                prediction.detach()[mask],
+                target.detach()[mask],
+                z.detach()[mask],
+                sigma.detach()[mask],
+                eps_floor,
+            ).detach()
+        )
+    return losses
+
+
+def prediction_to_x(
+    prediction_type: str,
+    prediction: torch.Tensor,
+    z: torch.Tensor,
+    sigma: torch.Tensor,
+) -> torch.Tensor:
+    if prediction_type == "x":
+        return prediction
+    if prediction_type == "v":
+        return z - sigma * prediction
+    raise ValueError(f"unsupported prediction_type: {prediction_type!r}")
+
+
+@torch.no_grad()
+def x_mse_by_cache_source(
+    *,
+    x_pred: torch.Tensor,
+    x_target: torch.Tensor,
+    source_indices: list[int],
+    source_count: int,
+) -> dict[int, float]:
+    losses: dict[int, float] = {}
+    if not source_indices:
+        return losses
+    source_tensor = torch.tensor(source_indices, device=x_pred.device)
+    for source_index in range(source_count):
+        mask = source_tensor == source_index
+        if not bool(mask.any()):
+            continue
+        losses[source_index] = float(torch.nn.functional.mse_loss(x_pred.detach()[mask].float(), x_target.detach()[mask].float()).detach())
+    return losses
 
 
 class CacheBatchCursor:
@@ -371,6 +477,23 @@ def planned_chunk_train_steps(
     return sum(resolve_max_train_steps(train_args, plan.num_samples * cache_multiplier) for plan in plans)
 
 
+def planned_prompt_set_train_steps(train_args: argparse.Namespace, chunk_args: argparse.Namespace, plans: list[ChunkPlan], prompt_sets: list[dict]) -> int:
+    if chunk_args.train_steps_per_chunk is not None:
+        return chunk_args.train_steps_per_chunk * len(plans)
+    if train_args.max_train_steps is not None:
+        return train_args.max_train_steps * len(plans)
+    total = 0
+    for plan in plans:
+        cache_sample_count = 0
+        for prompt_set in prompt_sets:
+            remaining = prompt_set_effective_total(prompt_set) - plan.start_index
+            if remaining > 0:
+                cache_sample_count += min(plan.num_samples, remaining)
+        if cache_sample_count > 0:
+            total += resolve_max_train_steps(train_args, cache_sample_count)
+    return total
+
+
 def enable_model_gradient_checkpointing(student: torch.nn.Module, args: argparse.Namespace) -> None:
     if not args.gradient_checkpointing:
         return
@@ -412,17 +535,97 @@ def init_wandb(args: argparse.Namespace):
     return wandb.init(**init_kwargs)
 
 
-def log_sample_images_to_wandb(wandb_run, image_paths: list[Path], prompt: str, step: int | None = None) -> None:
+def log_sample_images_to_wandb(
+    wandb_run,
+    image_paths: list[Path],
+    prompt: str,
+    step: int | None = None,
+    *,
+    key: str = "sample/images",
+) -> None:
     if wandb_run is None or not image_paths:
         return
     import wandb
 
-    images = [wandb.Image(str(path), caption=prompt) for path in image_paths]
-    payload = {"sample/images": images}
-    if step is None:
+    images = [wandb.Image(str(path), caption=sample_image_caption(path, prompt)) for path in image_paths]
+    payload = {key: images}
+    if step is not None:
+        step_key = f"{key[:-len('/images')]}/step" if key.endswith("/images") else f"{key}/step"
+        payload[step_key] = step
+    current_step = getattr(wandb_run, "step", None)
+    if step is None or (current_step is not None and step < current_step):
+        if step is not None and current_step is not None and step < current_step:
+            print(f"wandb media step {step} is behind current step {current_step}; logging without explicit step")
         wandb_run.log(payload)
     else:
         wandb_run.log(payload, step=step)
+
+
+def sample_image_caption(path: Path, prompt: str) -> str:
+    parent = path.parent.name
+    if parent == "lora":
+        mode = "x+lora"
+    elif parent == "fm_lora":
+        mode = "fm+lora"
+    elif parent == "x_lora":
+        mode = "x+lora"
+    elif parent in {"fm", "x", "teacher_sanity"}:
+        mode = parent
+    elif path.name.startswith("teacher-baseline"):
+        mode = "teacher_baseline"
+    else:
+        mode = "x"
+    sample_match = re.search(r"-(\d+)\.[^.]+$", path.name)
+    sample_suffix = f" #{sample_match.group(1)}" if sample_match else ""
+    label = f"{mode}{sample_suffix}"
+    return f"{label}\n{prompt}" if prompt else label
+
+
+def find_image_files(path: str | Path | None) -> list[Path]:
+    if not path:
+        return []
+    root = Path(path)
+    if not root.exists():
+        return []
+    if root.is_file():
+        return [root] if root.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"} else []
+    return sorted(
+        file
+        for file in root.rglob("*")
+        if file.is_file()
+        and file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        and ".ipynb_checkpoints" not in file.parts
+    )
+
+
+def maybe_import_compare_baseline(args: argparse.Namespace, wandb_run=None) -> list[Path]:
+    if getattr(args, "sample_compare_baseline_imported", False):
+        return []
+    source_dir = getattr(args, "sample_compare_baseline_source_dir", None)
+    if not source_dir:
+        args.sample_compare_baseline_imported = True
+        return []
+    source_images = find_image_files(source_dir)
+    if not source_images:
+        print(f"sample_compare baseline source has no images: {source_dir}")
+        args.sample_compare_baseline_imported = True
+        return []
+    output_root = Path(getattr(args, "sample_compare_baseline_output_dir", None) or REPO_ROOT / "compare-baseline")
+    output_root.mkdir(parents=True, exist_ok=True)
+    marker_path = output_root / ".wandb_uploaded"
+    copied: list[Path] = []
+    for index, source in enumerate(source_images):
+        target = output_root / f"teacher-baseline-{index:04d}{source.suffix.lower()}"
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        copied.append(target)
+    print(f"imported {len(copied)} compare baseline image(s) to {output_root}")
+    if getattr(args, "sample_compare_baseline_wandb_log_images", True) and not marker_path.exists():
+        prompt = getattr(args, "sample_compare_prompt", None) or getattr(args, "sample_prompt", "")
+        log_sample_images_to_wandb(wandb_run, copied, prompt, key="sample_compare/baseline")
+        marker_path.write_text("uploaded\n", encoding="utf-8")
+    args.sample_compare_baseline_imported = True
+    return copied
 
 
 def read_wandb_external_metrics(path: str | None) -> dict[str, float]:
@@ -511,6 +714,64 @@ def make_chunk_plan(
         remaining -= num_samples
         chunk_id += 1
     return plans
+
+
+def make_prompt_set_chunk_plan(
+    *,
+    prompt_sets: list[dict],
+    chunk_size: int,
+    max_chunks: int | None,
+) -> list[ChunkPlan]:
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    totals = []
+    for index, prompt_set in enumerate(prompt_sets):
+        num_samples = prompt_set.get("num_samples")
+        if num_samples is None:
+            raise ValueError(f"prompt_sets[{index}] requires num_samples when chunked_rum.total_samples is omitted")
+        totals.append(int(num_samples) * int(prompt_set.get("repeat", 1)))
+    total_samples = max(totals) if totals else 0
+    return make_chunk_plan(start_index=0, total_samples=total_samples, chunk_size=chunk_size, max_chunks=max_chunks)
+
+
+def prompt_set_effective_total(prompt_set: dict) -> int:
+    set_total = prompt_set.get("num_samples")
+    if set_total is None:
+        raise ValueError(f"prompt set {prompt_set.get('name', '<unnamed>')} requires num_samples")
+    return int(set_total) * int(prompt_set.get("repeat", 1))
+
+
+def prompt_set_slices_for_plan(prompt_set: dict, plan: ChunkPlan) -> list[dict]:
+    set_start = int(prompt_set.get("start_index", 0))
+    set_total = prompt_set.get("num_samples")
+    if set_total is None:
+        raise ValueError(f"prompt set {prompt_set.get('name', '<unnamed>')} requires num_samples")
+    set_total = int(set_total)
+    effective_total = prompt_set_effective_total(prompt_set)
+    effective_offset = plan.start_index
+    remaining = effective_total - effective_offset
+    if remaining <= 0:
+        return []
+    to_take = min(plan.num_samples, remaining)
+    slices: list[dict] = []
+    while to_take > 0:
+        offset_in_set = effective_offset % set_total
+        repeat_cycle = effective_offset // set_total
+        take = min(to_take, set_total - offset_in_set)
+        adjusted = dict(prompt_set)
+        adjusted["start_index"] = set_start + offset_in_set
+        adjusted["num_samples"] = take
+        adjusted["cache_chunk_offset"] = 0
+        adjusted["_repeat_cycle"] = repeat_cycle
+        slices.append(adjusted)
+        effective_offset += take
+        to_take -= take
+    return slices
+
+
+def prompt_set_slice_for_plan(prompt_set: dict, plan: ChunkPlan) -> dict | None:
+    slices = prompt_set_slices_for_plan(prompt_set, plan)
+    return slices[0] if slices else None
 
 
 def load_chunk_manifest(path: Path) -> dict:
@@ -604,13 +865,86 @@ def normalize_prompt_sets(args: argparse.Namespace) -> list[dict] | None:
                 "start_index": int(prompt_set.get("start_index", getattr(args, "start_index", 0))),
                 "num_samples": prompt_set.get("num_samples", getattr(args, "num_samples", None)),
                 "cache_chunk_offset": int(prompt_set.get("cache_chunk_offset", 0)),
+                "repeat": int(prompt_set.get("repeat", 1)),
             }
         )
+        if normalized[-1]["repeat"] < 1:
+            raise ValueError(f"prompt_sets[{index}].repeat must be >= 1")
     return normalized
+
+
+def prompt_set_mix_weights(prompt_sets: list[dict]) -> list[float]:
+    return [float(prompt_set_effective_total(prompt_set)) for prompt_set in prompt_sets]
 
 
 def prompt_set_chunk_name(prompt_set: dict, training_chunk_id: int) -> str:
     return f"chunk-{training_chunk_id + int(prompt_set.get('cache_chunk_offset', 0)):04d}"
+
+
+def link_or_symlink_cache_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, target)
+    except OSError:
+        try:
+            target.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, target)
+
+
+def link_repeated_prompt_set_cache(
+    *,
+    prompt_set: dict,
+    adjusted: dict,
+    chunk_size: int,
+    seed: int,
+    bucket_enabled: bool,
+    width: int,
+    height: int,
+    skip_existing: bool,
+) -> tuple[int, int]:
+    base_start = int(prompt_set.get("start_index", 0))
+    base_cache_dir = Path(prompt_set["cache_dir"])
+    dst_cache_dir = Path(adjusted["cache_dir"])
+    linked = 0
+    skipped = 0
+    for sample_index in range(int(adjusted["start_index"]), int(adjusted["start_index"]) + int(adjusted["num_samples"])):
+        offset = sample_index - base_start
+        if offset < 0:
+            raise ValueError(f"repeat sample index {sample_index} is before prompt set start_index {base_start}")
+        source_chunk_id = offset // chunk_size
+        source_cache_dir = base_cache_dir / prompt_set_chunk_name(prompt_set, source_chunk_id)
+        if bucket_enabled:
+            sample_width, sample_height = choose_cache_bucket(sample_index, seed)
+        else:
+            sample_width, sample_height = width, height
+        source = bucket_cache_path(
+            source_cache_dir,
+            sample_index,
+            width=sample_width,
+            height=sample_height,
+            bucket_enabled=bucket_enabled,
+        )
+        target = bucket_cache_path(
+            dst_cache_dir,
+            sample_index,
+            width=sample_width,
+            height=sample_height,
+            bucket_enabled=bucket_enabled,
+        )
+        if skip_existing and target.exists():
+            skipped += 1
+            continue
+        if not source.exists():
+            raise FileNotFoundError(
+                f"repeat cache source is missing: {source}. "
+                "Run earlier chunks first or disable repeat for this prompt set."
+            )
+        if target.exists():
+            target.unlink()
+        link_or_symlink_cache_file(source, target)
+        linked += 1
+    return linked, skipped
 
 
 def chunk_cache_dirs_for_prompt_sets(prompt_sets: list[dict], training_chunk_id: int) -> list[str]:
@@ -620,7 +954,12 @@ def chunk_cache_dirs_for_prompt_sets(prompt_sets: list[dict], training_chunk_id:
 def make_stage_args(config_path: str, command: str) -> argparse.Namespace:
     args = config_to_namespace(load_toml_config(config_path), command_override=command)
     args.config = str(Path(config_path).resolve())
-    args.func = {"build_cache": build_cache, "train_xpred": train_xpred, "sample_xpred": sample_xpred}[command]
+    args.func = {
+        "build_cache": build_cache,
+        "train_xpred": train_xpred,
+        "sample_xpred": sample_xpred,
+        "sample_compare": sample_compare,
+    }[command]
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     return args
@@ -647,8 +986,74 @@ def release_cuda_memory() -> None:
         torch.cuda.ipc_collect()
 
 
+def prepare_memory_for_training_generation(optimizer: torch.optim.Optimizer) -> None:
+    optimizer.zero_grad(set_to_none=True)
+    release_cuda_memory()
+
+
+def clear_adapter_teacher(adapter) -> None:
+    if adapter is not None and getattr(adapter, "teacher", None) is not None:
+        adapter.teacher.to("cpu")
+        adapter.teacher = None
+
+
+def load_compare_teacher(adapter, args: argparse.Namespace, *, checkpoint: str | None, lora: str | None, lora_weight: float | None):
+    original_dit = getattr(args, "dit", None)
+    original_lora = getattr(args, "teacher_lora", None)
+    original_lora_weight = getattr(args, "teacher_lora_weight", 1.0)
+    if checkpoint:
+        args.dit = checkpoint
+    args.teacher_lora = lora or None
+    args.teacher_lora_weight = 1.0 if lora_weight is None else float(lora_weight)
+    clear_adapter_teacher(adapter)
+    release_cuda_memory()
+    try:
+        return adapter._load_teacher()
+    finally:
+        args.dit = original_dit
+        args.teacher_lora = original_lora
+        args.teacher_lora_weight = original_lora_weight
+
+
+def load_lora_student_copy(
+    *,
+    student,
+    adapter,
+    args: argparse.Namespace,
+    checkpoint_path: Path,
+    lora: str | None,
+    lora_weight: float | None,
+):
+    if not lora:
+        return None
+    original_lora = getattr(args, "teacher_lora", None)
+    original_lora_weight = getattr(args, "teacher_lora_weight", 1.0)
+    original_adapter_student = getattr(adapter, "student", None)
+    args.teacher_lora = lora
+    args.teacher_lora_weight = 1.0 if lora_weight is None else float(lora_weight)
+    release_cuda_memory()
+    try:
+        adapter.save_student_xpred(student, checkpoint_path)
+        reference_parameter = next(student.parameters(), None)
+        reference_device = reference_parameter.device if reference_parameter is not None else torch.device(getattr(args, "device", "cpu"))
+        reference_dtype = reference_parameter.dtype if reference_parameter is not None else dtype_from_name(getattr(args, "mixed_precision", "fp32"))
+        lora_student = adapter.load_student_xpred(init_checkpoint=str(checkpoint_path))
+        lora_student.to(device=reference_device, dtype=reference_dtype).eval()
+        return lora_student
+    finally:
+        args.teacher_lora = original_lora
+        args.teacher_lora_weight = original_lora_weight
+        adapter.student = original_adapter_student
+
+
 def should_run_train_sample(args: argparse.Namespace, global_step: int) -> bool:
     every = getattr(args, "sample_every_steps", 0) or 0
+    total_step = getattr(args, "global_step_offset", 0) + global_step
+    return every > 0 and total_step > 0 and total_step % every == 0
+
+
+def should_run_train_compare(args: argparse.Namespace, global_step: int) -> bool:
+    every = getattr(args, "sample_compare_every_steps", 0) or 0
     total_step = getattr(args, "global_step_offset", 0) + global_step
     return every > 0 and total_step > 0 and total_step % every == 0
 
@@ -679,6 +1084,10 @@ def sample_from_training_student(
     )
     was_training = student.training
     student.eval()
+    lora_student = None
+    lora_checkpoint_path: Path | None = None
+    lora_latent = None
+    lora_sigmas = None
     try:
         if args.toy_smoke:
             if args.prediction_type == "x":
@@ -691,7 +1100,19 @@ def sample_from_training_student(
             original_prompt = getattr(args, "prompt", None)
             args.prompt = args.sample_prompt
             try:
-                student_forward = lambda z, sigma: adapter.student_forward_xpred(student, z, sigma, {})
+                sample_cfg = getattr(args, "sample_cfg", 1.0)
+                cond_embed, uncond_embed = adapter._encode_prompts([args.sample_prompt], cfg=sample_cfg, anima_model=student)
+                sample_conditioning = {
+                    "prompt_embeds": cond_embed.detach().to(dtype=dtype),
+                    "negative_prompt_embeds": uncond_embed.detach().to(dtype=dtype),
+                }
+                student_forward = lambda z, sigma: adapter.student_forward_xpred(
+                    student,
+                    z,
+                    sigma,
+                    sample_conditioning,
+                    guidance_scale=sample_cfg,
+                )
                 if args.prediction_type == "x":
                     x_latent = sample_with_xpred_student(student_forward, eps_latent, sigmas, eps_floor=args.sample_eps_floor)
                 else:
@@ -704,7 +1125,49 @@ def sample_from_training_student(
                         pass
                 else:
                     args.prompt = original_prompt
+            sample_lora = getattr(args, "sample_lora", None)
+            if sample_lora == "__inherit__":
+                sample_lora = None
+            if sample_lora:
+                lora_steps = args.sample_lora_steps if args.sample_lora_steps is not None else args.sample_steps
+                lora_eps_floor = args.sample_lora_eps_floor if args.sample_lora_eps_floor is not None else args.sample_eps_floor
+                lora_sigmas = make_shifted_sigma_schedule(lora_steps, args.flow_shift, device=device, dtype=dtype)
+                sample_dir_for_lora = Path(args.sample_output_dir) if args.sample_output_dir else Path(args.output_dir) / "train-samples"
+                lora_checkpoint_path = sample_dir_for_lora / "_tmp" / f"student-step-{total_step:06d}.safetensors"
+                lora_student = load_lora_student_copy(
+                    student=student,
+                    adapter=adapter,
+                    args=args,
+                    checkpoint_path=lora_checkpoint_path,
+                    lora=sample_lora,
+                    lora_weight=getattr(args, "sample_lora_weight", None),
+                )
+                if lora_student is not None:
+                    lora_cfg = getattr(args, "sample_lora_cfg", None)
+                    if lora_cfg is None:
+                        lora_cfg = sample_cfg
+                    lora_cond_embed, lora_uncond_embed = adapter._encode_prompts([args.sample_prompt], cfg=lora_cfg, anima_model=lora_student)
+                    lora_conditioning = {
+                        "prompt_embeds": lora_cond_embed.detach().to(dtype=dtype),
+                        "negative_prompt_embeds": lora_uncond_embed.detach().to(dtype=dtype),
+                    }
+                    lora_forward = lambda z, sigma: adapter.student_forward_xpred(
+                        lora_student,
+                        z,
+                        sigma,
+                        lora_conditioning,
+                        guidance_scale=lora_cfg,
+                    )
+                    if args.prediction_type == "x":
+                        lora_latent = sample_with_xpred_student(lora_forward, eps_latent.clone(), lora_sigmas, eps_floor=lora_eps_floor)
+                    else:
+                        lora_latent = sample_with_vpred_student(lora_forward, eps_latent.clone(), lora_sigmas)
     finally:
+        if lora_student is not None:
+            lora_student.to("cpu")
+            del lora_student
+        if lora_checkpoint_path is not None and lora_checkpoint_path.exists():
+            lora_checkpoint_path.unlink()
         if was_training:
             student.train()
 
@@ -716,6 +1179,17 @@ def sample_from_training_student(
         {"x_latent": x_latent.detach().cpu(), "sigmas": sigmas.detach().cpu(), "step": total_step, "local_step": global_step},
         latent_path,
     )
+    if lora_latent is not None:
+        lora_latent_path = latent_dir / f"{args.prediction_type}pred-lora-step-{total_step:06d}.pt"
+        torch.save(
+            {
+                "x_latent": lora_latent.detach().cpu(),
+                "sigmas": (lora_sigmas if lora_sigmas is not None else sigmas).detach().cpu(),
+                "step": total_step,
+                "local_step": global_step,
+            },
+            lora_latent_path,
+        )
     image_paths: list[Path] = []
     if args.sample_decode_images:
         if args.toy_smoke:
@@ -723,11 +1197,198 @@ def sample_from_training_student(
         else:
             image_dir = sample_dir / "images" / f"step-{total_step:06d}"
             image_paths = adapter.decode_latents_to_images(x_latent, image_dir, prefix=args.sample_image_prefix)
+            if lora_latent is not None:
+                image_paths.extend(adapter.decode_latents_to_images(lora_latent, image_dir / "lora", prefix=f"{args.sample_image_prefix}-lora"))
             print(f"saved {len(image_paths)} training sample image(s) to {image_dir}")
             if args.sample_wandb_log_images:
                 log_sample_images_to_wandb(wandb_run, image_paths, args.sample_prompt, step=total_step)
     print(f"saved training sample latent tensor to {latent_path}")
     del x_latent, sigmas, eps_latent
+    if lora_latent is not None:
+        del lora_latent
+    if lora_sigmas is not None:
+        del lora_sigmas
+    release_cuda_memory()
+    return image_paths
+
+
+@torch.no_grad()
+def sample_compare_from_training_student(
+    *,
+    student,
+    adapter,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+    global_step: int,
+    wandb_run=None,
+) -> list[Path]:
+    if args.prediction_type != "x":
+        raise ValueError("training sample_compare currently requires prediction_type='x'")
+    total_step = getattr(args, "global_step_offset", 0) + global_step
+    prompt = getattr(args, "sample_compare_prompt", None) or getattr(args, "sample_prompt", "")
+    width = args.sample_compare_width or args.sample_width or getattr(args, "width", None) or 1024
+    height = args.sample_compare_height or args.sample_height or getattr(args, "height", None) or 1024
+    seed = args.sample_compare_seed if args.sample_compare_seed is not None else (
+        args.sample_seed if args.sample_seed is not None else args.seed
+    )
+    sigmas = make_shifted_sigma_schedule(args.sample_compare_steps, args.flow_shift, device=device, dtype=dtype)
+    eps_latent = make_seeded_eps_batch(
+        list(range(args.sample_compare_num_samples)),
+        seed=seed,
+        height=height,
+        width=width,
+        device=device,
+        dtype=dtype,
+    )
+    was_training = student.training
+    student.eval()
+    release_cuda_memory()
+    original_prompt = None
+    results: dict[str, torch.Tensor] = {}
+    lora_student = None
+    lora_checkpoint_path: Path | None = None
+    sanity_teacher = None
+    try:
+        if args.toy_smoke:
+            student_forward = student
+        else:
+            if not prompt:
+                raise ValueError("training sample_compare requires sample_compare_prompt or sample_prompt for real Anima runs")
+            original_prompt = getattr(args, "prompt", None)
+            args.prompt = prompt
+            compare_cfg = getattr(args, "sample_compare_cfg", 1.0)
+            cond_embed, uncond_embed = adapter._encode_prompts([prompt], cfg=compare_cfg, anima_model=student)
+            student_conditioning = {
+                "prompt_embeds": cond_embed.detach().to(dtype=dtype),
+                "negative_prompt_embeds": uncond_embed.detach().to(dtype=dtype),
+            }
+            student_forward = lambda z, sigma: adapter.student_forward_xpred(
+                student,
+                z,
+                sigma,
+                student_conditioning,
+                guidance_scale=compare_cfg,
+            )
+        results["fm"] = sample_with_vpred_student(student_forward, eps_latent.clone(), sigmas)
+        results["x"] = sample_with_xpred_student(
+            student_forward,
+            eps_latent.clone(),
+            sigmas,
+            eps_floor=args.sample_compare_eps_floor,
+        )
+        compare_lora = getattr(args, "sample_compare_lora", None)
+        if compare_lora == "__inherit__":
+            compare_lora = None
+        if compare_lora and not args.toy_smoke:
+            compare_dir = Path(args.sample_compare_output_dir) if args.sample_compare_output_dir else Path(args.output_dir) / "train-compare-samples"
+            lora_checkpoint_path = compare_dir / "_tmp" / f"student-step-{total_step:06d}.safetensors"
+            lora_student = load_lora_student_copy(
+                student=student,
+                adapter=adapter,
+                args=args,
+                checkpoint_path=lora_checkpoint_path,
+                lora=compare_lora,
+                lora_weight=getattr(args, "sample_compare_lora_weight", None),
+            )
+            if lora_student is not None:
+                compare_lora_cfg = getattr(args, "sample_compare_lora_cfg", None)
+                if compare_lora_cfg is None:
+                    compare_lora_cfg = compare_cfg
+                lora_cond_embed, lora_uncond_embed = adapter._encode_prompts([prompt], cfg=compare_lora_cfg, anima_model=lora_student)
+                lora_conditioning = {
+                    "prompt_embeds": lora_cond_embed.detach().to(dtype=dtype),
+                    "negative_prompt_embeds": lora_uncond_embed.detach().to(dtype=dtype),
+                }
+                lora_student_forward = lambda z, sigma: adapter.student_forward_xpred(
+                    lora_student,
+                    z,
+                    sigma,
+                    lora_conditioning,
+                    guidance_scale=compare_lora_cfg,
+                )
+                results["fm_lora"] = sample_with_vpred_student(lora_student_forward, eps_latent.clone(), sigmas)
+                results["x_lora"] = sample_with_xpred_student(
+                    lora_student_forward,
+                    eps_latent.clone(),
+                    sigmas,
+                    eps_floor=args.sample_compare_eps_floor,
+                )
+        if getattr(args, "sample_compare_teacher_sanity", False) and not args.toy_smoke:
+            sanity_lora = getattr(args, "sample_compare_teacher_sanity_lora", None)
+            if sanity_lora == "__inherit__":
+                sanity_lora = None
+            sanity_teacher = load_compare_teacher(
+                adapter,
+                args,
+                checkpoint=getattr(args, "dit", None),
+                lora=sanity_lora,
+                lora_weight=getattr(args, "sample_compare_teacher_sanity_lora_weight", None),
+            )
+            sanity_teacher.to(device=device, dtype=dtype).eval()
+            sanity_latents = []
+            for sample_index in range(eps_latent.shape[0]):
+                sanity_latent, _ = adapter.teacher_sample_latent(
+                    prompt,
+                    eps_latent[sample_index : sample_index + 1],
+                    sigmas,
+                    guidance_scale=1.0,
+                )
+                sanity_latents.append(sanity_latent)
+            results["teacher_sanity"] = torch.cat(sanity_latents, dim=0)
+    finally:
+        if not args.toy_smoke:
+            if original_prompt is None:
+                try:
+                    delattr(args, "prompt")
+                except AttributeError:
+                    pass
+                else:
+                    args.prompt = original_prompt
+        if lora_student is not None:
+            lora_student.to("cpu")
+            del lora_student
+        if lora_checkpoint_path is not None and lora_checkpoint_path.exists():
+            lora_checkpoint_path.unlink()
+        if sanity_teacher is not None:
+            sanity_teacher.to("cpu")
+            del sanity_teacher
+        clear_adapter_teacher(adapter)
+        if was_training:
+            student.train()
+
+    compare_dir = Path(args.sample_compare_output_dir) if args.sample_compare_output_dir else Path(args.output_dir) / "train-compare-samples"
+    step_dir = compare_dir / f"step-{total_step:06d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    latent_path = step_dir / "compare-latents.pt"
+    torch.save(
+        {
+            "latents": {key: value.detach().cpu() for key, value in results.items()},
+            "sigmas": sigmas.detach().cpu(),
+            "modes": list(results),
+            "step": total_step,
+            "local_step": global_step,
+        },
+        latent_path,
+    )
+    image_paths: list[Path] = []
+    if args.sample_compare_decode_images:
+        if args.toy_smoke:
+            print("sample_compare_decode_images=true ignored for toy_smoke training compare samples")
+        else:
+            for key, latent in results.items():
+                image_paths.extend(
+                    adapter.decode_latents_to_images(
+                        latent,
+                        step_dir / "images" / key,
+                        prefix=f"{args.sample_compare_image_prefix}-{key}",
+                    )
+                )
+            print(f"saved {len(image_paths)} training compare image(s) to {step_dir / 'images'}")
+            if args.sample_compare_wandb_log_images:
+                log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=total_step, key="sample_compare/images")
+    print(f"saved training compare latent tensor to {latent_path}")
+    del results, sigmas, eps_latent
     release_cuda_memory()
     return image_paths
 
@@ -857,12 +1518,22 @@ def chunked_rum(args: argparse.Namespace) -> None:
     chunk_root = Path(args.chunk_root)
     chunk_root.mkdir(parents=True, exist_ok=True)
     manifest_path = chunk_root / "chunk-manifest.json"
-    plans = make_chunk_plan(
-        start_index=args.start_index,
-        total_samples=args.total_samples,
-        chunk_size=args.chunk_size,
-        max_chunks=args.max_chunks,
-    )
+    base_train_args = make_stage_args(args.config, "train_xpred")
+    base_cache_args = make_stage_args(args.config, "build_cache")
+    prompt_sets = normalize_prompt_sets(base_cache_args)
+    if prompt_sets is not None and args.total_samples is None:
+        plans = make_prompt_set_chunk_plan(prompt_sets=prompt_sets, chunk_size=args.chunk_size, max_chunks=args.max_chunks)
+        plan_source = "prompt_sets"
+    else:
+        if args.total_samples is None:
+            raise ValueError("chunked_rum requires total_samples when build_cache.prompt_sets is not enabled")
+        plans = make_chunk_plan(
+            start_index=args.start_index,
+            total_samples=args.total_samples,
+            chunk_size=args.chunk_size,
+            max_chunks=args.max_chunks,
+        )
+        plan_source = "chunked_rum"
     manifest = load_chunk_manifest(manifest_path)
     completed = completed_chunk_ids(manifest) if args.resume else set()
     previous_checkpoint = None
@@ -873,15 +1544,16 @@ def chunked_rum(args: argparse.Namespace) -> None:
         if isinstance(chunk, dict) and "chunk_id" in chunk
     }
     global_step_offset = 0
-    base_train_args = make_stage_args(args.config, "train_xpred")
-    base_cache_args = make_stage_args(args.config, "build_cache")
-    prompt_sets = normalize_prompt_sets(base_cache_args)
-    cache_multiplier = len(prompt_sets) if prompt_sets is not None else 1
-    planned_total_train_steps = planned_chunk_train_steps(base_train_args, args, plans, cache_multiplier=cache_multiplier)
+    if prompt_sets is not None and args.total_samples is None:
+        planned_total_train_steps = planned_prompt_set_train_steps(base_train_args, args, plans, prompt_sets)
+    else:
+        cache_multiplier = len(prompt_sets) if prompt_sets is not None else 1
+        planned_total_train_steps = planned_chunk_train_steps(base_train_args, args, plans, cache_multiplier=cache_multiplier)
 
     print(
         f"chunked_rum: {len(plans)} planned chunk(s), chunk_size={args.chunk_size}, "
-        f"total_samples={args.total_samples}, resume={args.resume}"
+        f"total_samples={args.total_samples if args.total_samples is not None else '<from prompt_sets>'}, "
+        f"plan_source={plan_source}, resume={args.resume}"
     )
     for plan in plans:
         chunk_name = f"chunk-{plan.chunk_id:04d}"
@@ -910,20 +1582,58 @@ def chunked_rum(args: argparse.Namespace) -> None:
             manifest_cache_value: str | list[str] = str(chunk_cache_dir)
         else:
             adjusted_sets = []
+            repeat_link_slices: list[tuple[dict, dict]] = []
             for prompt_set in cache_prompt_sets:
-                adjusted = dict(prompt_set)
-                adjusted["cache_dir"] = str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, plan.chunk_id))
-                adjusted["start_index"] = int(prompt_set["start_index"]) + (plan.start_index - args.start_index)
-                adjusted["num_samples"] = plan.num_samples
-                adjusted["cache_chunk_offset"] = 0
-                adjusted_sets.append(adjusted)
+                if args.total_samples is None:
+                    slices = prompt_set_slices_for_plan(prompt_set, plan)
+                else:
+                    adjusted = dict(prompt_set)
+                    adjusted["start_index"] = int(prompt_set["start_index"]) + (plan.start_index - args.start_index)
+                    adjusted["num_samples"] = plan.num_samples
+                    adjusted["cache_chunk_offset"] = 0
+                    slices = [adjusted]
+                for adjusted in slices:
+                    adjusted["cache_dir"] = str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, plan.chunk_id))
+                    if int(adjusted.get("_repeat_cycle", 0)) > 0:
+                        repeat_link_slices.append((prompt_set, adjusted))
+                    else:
+                        adjusted_sets.append(adjusted)
+            if not adjusted_sets and not repeat_link_slices:
+                print(f"{chunk_name}: no prompt set has samples for this chunk, skipping")
+                continue
             cache_args.prompt_sets = adjusted_sets
-            cache_dirs = [str(Path(prompt_set["cache_dir"])) for prompt_set in adjusted_sets]
+            cache_dirs = list(
+                dict.fromkeys(
+                    [str(Path(prompt_set["cache_dir"])) for prompt_set in adjusted_sets]
+                    + [str(Path(adjusted["cache_dir"])) for _prompt_set, adjusted in repeat_link_slices]
+                )
+            )
             manifest_cache_value = cache_dirs
         update_chunk_manifest(manifest_path, plan, status="building_cache", cache_dir=manifest_cache_value)
         print(f"{chunk_name}: building cache start_index={plan.start_index} num_samples={plan.num_samples}")
-        build_cache(cache_args)
-        release_cuda_memory()
+        if cache_prompt_sets is None:
+            build_cache(cache_args)
+            release_cuda_memory()
+        else:
+            if adjusted_sets:
+                build_cache(cache_args)
+                release_cuda_memory()
+            for prompt_set, adjusted in repeat_link_slices:
+                linked, skipped_links = link_repeated_prompt_set_cache(
+                    prompt_set=prompt_set,
+                    adjusted=adjusted,
+                    chunk_size=args.chunk_size,
+                    seed=cache_args.seed,
+                    bucket_enabled=bool(getattr(cache_args, "bucket_enabled", False)),
+                    width=cache_args.width,
+                    height=cache_args.height,
+                    skip_existing=cache_args.skip_existing,
+                )
+                print(
+                    f"{chunk_name}: linked repeat cache set={prompt_set['name']} "
+                    f"start_index={adjusted['start_index']} num_samples={adjusted['num_samples']} "
+                    f"linked={linked} skipped={skipped_links}"
+                )
         update_chunk_manifest(manifest_path, plan, status="cache_built", cache_dir=manifest_cache_value)
 
         train_args = make_stage_args(args.config, "train_xpred")
@@ -935,6 +1645,12 @@ def chunked_rum(args: argparse.Namespace) -> None:
             train_args.cache_dirs = cache_dirs
             if getattr(train_args, "cache_mix_mode", "single") == "single":
                 train_args.cache_mix_mode = "batch_weighted"
+            if prompt_sets is not None and args.total_samples is None and getattr(train_args, "cache_mix_weights", None) is None:
+                weight_by_dir = {
+                    str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, plan.chunk_id)): prompt_set_effective_total(prompt_set)
+                    for prompt_set in cache_prompt_sets
+                }
+                train_args.cache_mix_weights = [float(weight_by_dir[cache_dir]) for cache_dir in cache_dirs]
         train_args.output_dir = str(chunk_output_dir)
         train_args.student_init = resolve_chunk_student_init(args, previous_checkpoint)
         train_args.optimizer_state = resolve_chunk_optimizer_state(args, previous_optimizer_state)
@@ -989,10 +1705,12 @@ def train_xpred(args: argparse.Namespace) -> None:
     if cache_dirs:
         cache_bucket_sets = [collect_cache_buckets(cache_dir) for cache_dir in cache_dirs]
         cache_files = [path for buckets in cache_bucket_sets for bucket in buckets for path in bucket.files]
+        cache_source_names = unique_cache_source_names(cache_dirs)
     else:
         cache_buckets = collect_cache_buckets(args.cache_dir)
         cache_bucket_sets = [cache_buckets]
         cache_files = [path for bucket in cache_buckets for path in bucket.files]
+        cache_source_names = []
     if not cache_files:
         cache_label = cache_dirs if cache_dirs else args.cache_dir
         raise ValueError(f"no safetensors cache files found in {cache_label}")
@@ -1071,8 +1789,13 @@ def train_xpred(args: argparse.Namespace) -> None:
             set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
             micro_losses: list[float] = []
+            micro_x_mses: list[float] = []
+            micro_source_losses: dict[str, list[float]] = {name: [] for name in cache_source_names}
+            micro_source_x_mses: dict[str, list[float]] = {name: [] for name in cache_source_names}
             for _ in range(args.gradient_accumulation_steps):
-                sample = merge_cache_samples(batch_cursor.next(), device=device, dtype=dtype)
+                batch_paths = batch_cursor.next()
+                source_indices = cache_source_indices_for_paths(batch_paths, cache_dirs) if cache_dirs else []
+                sample = merge_cache_samples(batch_paths, device=device, dtype=dtype)
                 sigma = sample_train_sigmas(
                     sample["x_teacher_latent"].shape[0],
                     sigma_min_train=args.sigma_min_train,
@@ -1101,6 +1824,29 @@ def train_xpred(args: argparse.Namespace) -> None:
                 )
                 if not torch.isfinite(loss_value):
                     raise FloatingPointError(f"non-finite {args.prediction_type}-pred loss")
+                x_prediction = prediction_to_x(args.prediction_type, prediction, z, sigma)
+                x_mse = torch.nn.functional.mse_loss(x_prediction.detach().float(), sample["x_teacher_latent"].detach().float())
+                micro_x_mses.append(float(x_mse.detach()))
+                if cache_dirs:
+                    for source_index, source_loss in loss_by_cache_source(
+                        prediction_type=args.prediction_type,
+                        loss_weighting=args.loss_weighting,
+                        prediction=prediction,
+                        target=target,
+                        z=z,
+                        sigma=sigma,
+                        eps_floor=args.loss_eps_floor,
+                        source_indices=source_indices,
+                        source_count=len(cache_dirs),
+                    ).items():
+                        micro_source_losses[cache_source_names[source_index]].append(source_loss)
+                    for source_index, source_x_mse in x_mse_by_cache_source(
+                        x_pred=x_prediction,
+                        x_target=sample["x_teacher_latent"],
+                        source_indices=source_indices,
+                        source_count=len(cache_dirs),
+                    ).items():
+                        micro_source_x_mses[cache_source_names[source_index]].append(source_x_mse)
                 (loss_value / args.gradient_accumulation_steps).backward()
                 micro_losses.append(float(loss_value.detach()))
             grad_norm = None
@@ -1113,25 +1859,65 @@ def train_xpred(args: argparse.Namespace) -> None:
             completed_train_steps = global_step
             args.completed_train_steps = completed_train_steps
             loss = sum(micro_losses) / len(micro_losses)
+            x_mse = sum(micro_x_mses) / len(micro_x_mses)
+            source_losses = {
+                name: sum(values) / len(values)
+                for name, values in micro_source_losses.items()
+                if values
+            }
+            source_x_mses = {
+                name: sum(values) / len(values)
+                for name, values in micro_source_x_mses.items()
+                if values
+            }
             losses.append(float(loss))
             if wandb_run is not None:
                 grad_norm_value = None if grad_norm is None else float(grad_norm)
                 wandb_metrics = {
                     "train/loss": float(loss),
+                    "train/x_mse": float(x_mse),
                     "train/lr": current_lr,
                     "train/grad_norm": grad_norm_value,
                     "grad_norm": grad_norm_value,
                     "train/effective_batch_size": args.train_batch_size * args.gradient_accumulation_steps,
                 }
+                for name, source_loss in source_losses.items():
+                    wandb_metrics[f"train/loss_by_cache/{name}"] = float(source_loss)
+                for name, source_x_mse in source_x_mses.items():
+                    wandb_metrics[f"train/x_mse_by_cache/{name}"] = float(source_x_mse)
                 if args.wandb_metrics_log_every > 0 and global_step % args.wandb_metrics_log_every == 0:
                     wandb_metrics.update(read_wandb_external_metrics(args.wandb_metrics_file))
                 wandb_run.log(wandb_metrics, step=total_step)
             if global_step % args.log_every == 0:
                 grad_text = "" if grad_norm is None else f" grad_norm={float(grad_norm):.6f}"
                 offset_text = "" if getattr(args, "global_step_offset", 0) == 0 else f" total_step={total_step}"
-                print(f"step={global_step}{offset_text} loss={float(loss):.6f} lr={current_lr:.8g}{grad_text}")
-            if should_run_train_sample(args, global_step):
+                source_text = ""
+                if source_losses:
+                    source_text = " " + " ".join(f"loss/{name}={value:.6f}" for name, value in source_losses.items())
+                source_x_text = ""
+                if source_x_mses:
+                    source_x_text = " " + " ".join(f"x_mse/{name}={value:.6f}" for name, value in source_x_mses.items())
+                print(
+                    f"step={global_step}{offset_text} loss={float(loss):.6f} x_mse={float(x_mse):.6f}"
+                    f"{source_text}{source_x_text} lr={current_lr:.8g}{grad_text}"
+                )
+            run_train_sample = should_run_train_sample(args, global_step)
+            run_train_compare = should_run_train_compare(args, global_step)
+            if run_train_sample or run_train_compare:
+                prepare_memory_for_training_generation(optimizer)
+            if run_train_sample:
                 sample_from_training_student(
+                    student=student,
+                    adapter=adapter,
+                    args=args,
+                    device=device,
+                    dtype=dtype,
+                    global_step=global_step,
+                    wandb_run=wandb_run,
+                )
+            if run_train_compare:
+                maybe_import_compare_baseline(args, wandb_run=wandb_run)
+                sample_compare_from_training_student(
                     student=student,
                     adapter=adapter,
                     args=args,
@@ -1255,6 +2041,113 @@ def sample_xpred(args: argparse.Namespace) -> None:
     release_cuda_memory()
 
 
+def sample_compare(args: argparse.Namespace) -> None:
+    if args.prediction_type != "x":
+        raise ValueError("sample_compare currently compares an x-pred student against an FM teacher; set prediction_type='x'")
+    device = torch.device(args.device)
+    dtype = dtype_from_name(args.mixed_precision)
+    sigmas = make_shifted_sigma_schedule(args.steps, args.flow_shift, device=device, dtype=dtype)
+    eps_latent = make_seeded_eps_batch(
+        list(range(args.num_samples)),
+        seed=args.seed,
+        height=args.height,
+        width=args.width,
+        device=device,
+        dtype=dtype,
+    )
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    adapter = None if args.toy_smoke else load_object(args.adapter)(args, device=device, dtype=dtype)
+    results: dict[str, torch.Tensor] = {}
+    if args.toy_smoke:
+        student = ToyXPredNet().to(device=device, dtype=dtype)
+        state = torch.load(args.student_checkpoint, map_location=device)
+        student.load_state_dict(state["state_dict"])
+        student.eval()
+
+        def teacher_forward(z: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+            x_teacher = torch.cat(
+                [make_toy_teacher_endpoint(z[i : i + 1], i) for i in range(z.shape[0])],
+                dim=0,
+            )
+            return xpred_to_anima_v(z, x_teacher, sigma, args.eps_floor)
+
+        student_forward = student
+        for alpha in args.alphas:
+            alpha = float(alpha)
+            if alpha == 0.0:
+                teacher_latent, _ = adapter.teacher_sample_latent(args.prompt, eps_latent, sigmas, guidance_scale=args.teacher_cfg)
+                results[f"alpha-{alpha:g}"] = teacher_latent
+                continue
+            results[f"alpha-{alpha:g}"] = sample_with_mixed_velocity(
+                teacher_forward,
+                student_forward,
+                eps_latent,
+                sigmas,
+                alpha=alpha,
+                eps_floor=args.eps_floor,
+            )
+    else:
+        if not args.prompt:
+            raise ValueError("sample_compare requires prompt for real Anima runs")
+        teacher = load_compare_teacher(
+            adapter,
+            args,
+            checkpoint=args.teacher_checkpoint,
+            lora=getattr(args, "teacher_lora", None),
+            lora_weight=getattr(args, "teacher_lora_weight", None),
+        )
+        student = adapter.load_student_xpred(init_checkpoint=args.student_checkpoint)
+        student.to(device=device, dtype=dtype).eval()
+        teacher.to(device=device, dtype=dtype).eval()
+        args.prompt = args.prompt
+        cond_embed, uncond_embed = adapter._encode_prompts([args.prompt], cfg=args.teacher_cfg, anima_model=teacher)
+        teacher_conditioning = {
+            "prompt_embeds": cond_embed.detach().to(dtype=dtype),
+            "negative_prompt_embeds": uncond_embed.detach().to(dtype=dtype),
+        }
+        student_conditioning = {"prompt_embeds": cond_embed.detach().to(dtype=dtype)}
+        teacher_forward = lambda z, sigma: adapter.teacher_forward_vpred(
+            teacher,
+            z,
+            sigma,
+            teacher_conditioning,
+            guidance_scale=args.teacher_cfg,
+        )
+        student_forward = lambda z, sigma: adapter.student_forward_xpred(student, z, sigma, student_conditioning)
+        for alpha in args.alphas:
+            results[f"alpha-{alpha:g}"] = sample_with_mixed_velocity(
+                teacher_forward,
+                student_forward,
+                eps_latent,
+                sigmas,
+                alpha=float(alpha),
+                eps_floor=args.eps_floor,
+            )
+
+    torch.save(
+        {"latents": {key: value.detach().cpu() for key, value in results.items()}, "sigmas": sigmas.detach().cpu(), "alphas": list(args.alphas)},
+        output_dir / "compare-latents.pt",
+    )
+    print(f"saved compare latent tensor to {output_dir / 'compare-latents.pt'}")
+
+    image_paths: list[Path] = []
+    if args.decode_sample_images:
+        if args.toy_smoke:
+            print("decode_sample_images=true ignored for toy_smoke sample_compare")
+        else:
+            for key, latent in results.items():
+                image_paths.extend(adapter.decode_latents_to_images(latent, output_dir / "images" / key, prefix=f"{args.sample_image_prefix}-{key}"))
+            print(f"saved {len(image_paths)} compare image(s) to {output_dir / 'images'}")
+            wandb_run = init_wandb(args)
+            if args.wandb_log_sample_images:
+                log_sample_images_to_wandb(wandb_run, image_paths, args.prompt, step=None, key="sample_compare/images")
+            if wandb_run is not None:
+                wandb_run.finish()
+    release_cuda_memory()
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
@@ -1363,6 +2256,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sample_prompt", default="")
     train.add_argument("--sample_steps", type=int, default=DEFAULT_TEACHER_STEPS)
     train.add_argument("--sample_num_samples", type=int, default=1)
+    train.add_argument("--sample_cfg", type=float, default=1.0)
     train.add_argument("--sample_eps_floor", type=float, default=DEFAULT_EPS_FLOOR)
     train.add_argument("--sample_width", type=int, default=None)
     train.add_argument("--sample_height", type=int, default=None)
@@ -1371,6 +2265,33 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sample_decode_images", action="store_true")
     train.add_argument("--sample_image_prefix", default="train-sample")
     train.add_argument("--sample_wandb_log_images", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--sample_lora", default="__inherit__")
+    train.add_argument("--sample_lora_weight", type=float, default=None)
+    train.add_argument("--sample_lora_steps", type=int, default=None)
+    train.add_argument("--sample_lora_cfg", type=float, default=None)
+    train.add_argument("--sample_lora_eps_floor", type=float, default=None)
+    train.add_argument("--sample_compare_every_steps", type=int, default=0)
+    train.add_argument("--sample_compare_prompt", default="")
+    train.add_argument("--sample_compare_steps", type=int, default=DEFAULT_TEACHER_STEPS)
+    train.add_argument("--sample_compare_num_samples", type=int, default=1)
+    train.add_argument("--sample_compare_cfg", type=float, default=1.0)
+    train.add_argument("--sample_compare_eps_floor", type=float, default=DEFAULT_EPS_FLOOR)
+    train.add_argument("--sample_compare_width", type=int, default=None)
+    train.add_argument("--sample_compare_height", type=int, default=None)
+    train.add_argument("--sample_compare_seed", type=int, default=None)
+    train.add_argument("--sample_compare_output_dir", default=None)
+    train.add_argument("--sample_compare_baseline_source_dir", default=None)
+    train.add_argument("--sample_compare_baseline_output_dir", default=None)
+    train.add_argument("--sample_compare_baseline_wandb_log_images", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--sample_compare_lora", default="__inherit__")
+    train.add_argument("--sample_compare_lora_weight", type=float, default=None)
+    train.add_argument("--sample_compare_lora_cfg", type=float, default=None)
+    train.add_argument("--sample_compare_teacher_sanity", action="store_true")
+    train.add_argument("--sample_compare_teacher_sanity_lora", default="__inherit__")
+    train.add_argument("--sample_compare_teacher_sanity_lora_weight", type=float, default=None)
+    train.add_argument("--sample_compare_decode_images", action="store_true")
+    train.add_argument("--sample_compare_image_prefix", default="compare")
+    train.add_argument("--sample_compare_wandb_log_images", action=argparse.BooleanOptionalAction, default=True)
     add_wandb_args(train)
     train.add_argument("--dry_run", action="store_true")
     train.set_defaults(func=train_xpred)
@@ -1392,6 +2313,28 @@ def parse_args() -> argparse.Namespace:
     sample.add_argument("--wandb_log_sample_images", action=argparse.BooleanOptionalAction, default=True)
     add_wandb_args(sample)
     sample.set_defaults(func=sample_xpred)
+
+    compare = subparsers.add_parser("sample_compare", help="Compare teacher FM, mixed velocity, and student x-pred sampling.")
+    add_common_args(compare)
+    compare.add_argument("--student_checkpoint")
+    compare.add_argument("--teacher_checkpoint", default=None)
+    compare.add_argument("--teacher_lora", default="__inherit__")
+    compare.add_argument("--teacher_lora_weight", type=float, default=None)
+    compare.add_argument("--output_dir")
+    compare.add_argument("--prediction_type", default="x", choices=["x"])
+    compare.add_argument("--prompt", default="")
+    compare.add_argument("--num_samples", type=int, default=1)
+    compare.add_argument("--steps", type=int, default=DEFAULT_TEACHER_STEPS)
+    compare.add_argument("--width", type=int, default=1024)
+    compare.add_argument("--height", type=int, default=1024)
+    compare.add_argument("--eps_floor", type=float, default=DEFAULT_EPS_FLOOR)
+    compare.add_argument("--alphas", nargs="*", type=float, default=[0.0, 0.25, 0.5, 0.75, 1.0])
+    compare.add_argument("--teacher_cfg", type=float, default=DEFAULT_TEACHER_CFG)
+    compare.add_argument("--decode_sample_images", action="store_true")
+    compare.add_argument("--sample_image_prefix", default="compare")
+    compare.add_argument("--wandb_log_sample_images", action=argparse.BooleanOptionalAction, default=True)
+    add_wandb_args(compare)
+    compare.set_defaults(func=sample_compare)
 
     chunked_stage = subparsers.add_parser("chunked_rum", help="Build cache chunks and train after each chunk with resume manifest.")
     add_common_args(chunked_stage)
@@ -1416,6 +2359,7 @@ def parse_args() -> argparse.Namespace:
             "build_cache": build_cache,
             "train_xpred": train_xpred,
             "sample_xpred": sample_xpred,
+            "sample_compare": sample_compare,
             "chunked_rum": chunked_rum,
         }[args.command]
     elif not args.command:
@@ -1423,8 +2367,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
-    if not args.toy_smoke and (not args.dit and args.command in {"build_cache", "chunked_rum"}):
-        parser.error("real Anima build_cache/chunked_rum requires --dit; use --toy_smoke for local smoke tests")
+    if not args.toy_smoke and (not args.dit and args.command in {"build_cache", "chunked_rum", "sample_compare"}):
+        parser.error("real Anima build_cache/chunked_rum/sample_compare requires --dit; use --toy_smoke for local smoke tests")
     if not args.toy_smoke and not args.text_encoder:
         parser.error("real Anima runs require --text_encoder; use --toy_smoke for local smoke tests")
     if args.command == "build_cache" and not getattr(args, "prompt_sets", None) and (not args.prompts or not args.cache_dir):
@@ -1444,6 +2388,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("cache_mix_weights must be non-negative and sum to > 0")
     if args.command == "sample_xpred" and (not args.checkpoint or not args.output):
         parser.error("sample_xpred requires checkpoint and output")
+    if args.command == "sample_compare" and (not args.student_checkpoint or not args.output_dir):
+        parser.error("sample_compare requires student_checkpoint and output_dir")
     if hasattr(args, "prediction_type") and args.prediction_type not in {"x", "v"}:
         parser.error("prediction_type must be 'x' or 'v'")
     if hasattr(args, "loss_weighting") and args.loss_weighting == "jlt_velocity_readout" and args.prediction_type != "x":
@@ -1459,9 +2405,9 @@ def parse_args() -> argparse.Namespace:
             parser.error("chunked_rum requires --config")
         if not args.chunk_root:
             parser.error("chunked_rum requires chunk_root")
-        if args.total_samples is None:
-            parser.error("chunked_rum requires total_samples")
-        if args.total_samples < 1:
+        if args.total_samples is None and not getattr(make_stage_args(args.config, "build_cache"), "prompt_sets", None):
+            parser.error("chunked_rum requires total_samples unless build_cache.prompt_sets is enabled")
+        if args.total_samples is not None and args.total_samples < 1:
             parser.error("total_samples must be >= 1")
         if args.chunk_size < 1:
             parser.error("chunk_size must be >= 1")
@@ -1495,12 +2441,40 @@ def parse_args() -> argparse.Namespace:
         parser.error("sample_steps must be >= 1")
     if hasattr(args, "sample_num_samples") and args.sample_num_samples < 1:
         parser.error("sample_num_samples must be >= 1")
+    if hasattr(args, "sample_cfg") and args.sample_cfg < 0:
+        parser.error("sample_cfg must be >= 0")
     if hasattr(args, "sample_eps_floor") and args.sample_eps_floor <= 0:
         parser.error("sample_eps_floor must be > 0")
+    if getattr(args, "sample_lora_steps", None) is not None and args.sample_lora_steps < 1:
+        parser.error("sample_lora_steps must be >= 1")
+    if getattr(args, "sample_lora_cfg", None) is not None and args.sample_lora_cfg < 0:
+        parser.error("sample_lora_cfg must be >= 0")
+    if getattr(args, "sample_lora_eps_floor", None) is not None and args.sample_lora_eps_floor <= 0:
+        parser.error("sample_lora_eps_floor must be > 0")
+    if hasattr(args, "eps_floor") and args.eps_floor <= 0:
+        parser.error("eps_floor must be > 0")
+    if hasattr(args, "alphas") and any(alpha < 0 or alpha > 1 for alpha in args.alphas):
+        parser.error("alphas must be in [0, 1]")
     if getattr(args, "sample_width", None) is not None and args.sample_width < 8:
         parser.error("sample_width must be >= 8")
     if getattr(args, "sample_height", None) is not None and args.sample_height < 8:
         parser.error("sample_height must be >= 8")
+    if hasattr(args, "sample_compare_every_steps") and args.sample_compare_every_steps < 0:
+        parser.error("sample_compare_every_steps must be >= 0")
+    if hasattr(args, "sample_compare_steps") and args.sample_compare_steps < 1:
+        parser.error("sample_compare_steps must be >= 1")
+    if hasattr(args, "sample_compare_num_samples") and args.sample_compare_num_samples < 1:
+        parser.error("sample_compare_num_samples must be >= 1")
+    if hasattr(args, "sample_compare_cfg") and args.sample_compare_cfg < 0:
+        parser.error("sample_compare_cfg must be >= 0")
+    if hasattr(args, "sample_compare_eps_floor") and args.sample_compare_eps_floor <= 0:
+        parser.error("sample_compare_eps_floor must be > 0")
+    if getattr(args, "sample_compare_lora_cfg", None) is not None and args.sample_compare_lora_cfg < 0:
+        parser.error("sample_compare_lora_cfg must be >= 0")
+    if getattr(args, "sample_compare_width", None) is not None and args.sample_compare_width < 8:
+        parser.error("sample_compare_width must be >= 8")
+    if getattr(args, "sample_compare_height", None) is not None and args.sample_compare_height < 8:
+        parser.error("sample_compare_height must be >= 8")
     if getattr(args, "vae_spatial_chunk_size", None) is not None and args.vae_spatial_chunk_size < 1:
         parser.error("vae_spatial_chunk_size must be >= 1")
     if (
@@ -1511,12 +2485,32 @@ def parse_args() -> argparse.Namespace:
         and not args.vae
     ):
         parser.error("sample_decode_images during train_xpred requires --vae / [common].vae")
-    if args.command == "sample_xpred" and getattr(args, "decode_sample_images", False) and not args.toy_smoke and not args.vae:
+    if (
+        args.command == "train_xpred"
+        and getattr(args, "sample_compare_every_steps", 0) > 0
+        and getattr(args, "prediction_type", "x") != "x"
+    ):
+        parser.error("training sample_compare requires prediction_type='x'")
+    if (
+        args.command == "train_xpred"
+        and getattr(args, "sample_compare_every_steps", 0) > 0
+        and getattr(args, "sample_compare_decode_images", False)
+        and not args.toy_smoke
+        and not args.vae
+    ):
+        parser.error("sample_compare_decode_images during train_xpred requires --vae / [common].vae")
+    if args.command in {"sample_xpred", "sample_compare"} and getattr(args, "decode_sample_images", False) and not args.toy_smoke and not args.vae:
         parser.error("decode_sample_images requires --vae / [common].vae")
     if hasattr(args, "num_samples") and args.num_samples is not None and args.num_samples < 1:
         parser.error("num_samples must be >= 1")
-    if hasattr(args, "teacher_lora_weight") and args.teacher_lora_weight < 0:
+    if hasattr(args, "teacher_lora_weight") and args.teacher_lora_weight is not None and args.teacher_lora_weight < 0:
         parser.error("teacher_lora_weight must be >= 0")
+    if hasattr(args, "sample_lora_weight") and args.sample_lora_weight is not None and args.sample_lora_weight < 0:
+        parser.error("sample_lora_weight must be >= 0")
+    if hasattr(args, "sample_compare_lora_weight") and args.sample_compare_lora_weight is not None and args.sample_compare_lora_weight < 0:
+        parser.error("sample_compare_lora_weight must be >= 0")
+    if hasattr(args, "sample_compare_teacher_sanity_lora_weight") and args.sample_compare_teacher_sanity_lora_weight is not None and args.sample_compare_teacher_sanity_lora_weight < 0:
+        parser.error("sample_compare_teacher_sanity_lora_weight must be >= 0")
     return args
 
 

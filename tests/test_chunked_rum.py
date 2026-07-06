@@ -6,6 +6,8 @@ from scripts.dev.anima_rum_xpred_train import (
     MultiCacheBucketBatchCursor,
     ChunkPlan,
     allocate_weighted_counts,
+    cache_source_indices_for_paths,
+    cache_source_name,
     chunk_train_steps,
     completed_chunk_ids,
     final_optimizer_state_for_train_args,
@@ -13,14 +15,25 @@ from scripts.dev.anima_rum_xpred_train import (
     chunk_cache_dirs_for_prompt_sets,
     choose_cache_bucket,
     collect_cache_buckets,
+    link_repeated_prompt_set_cache,
     lr_scale_for_step,
+    loss_by_cache_source,
     make_chunk_plan,
+    make_prompt_set_chunk_plan,
     planned_chunk_train_steps,
+    planned_prompt_set_train_steps,
+    prediction_to_x,
+    prompt_set_mix_weights,
+    prompt_set_slice_for_plan,
+    prompt_set_slices_for_plan,
     prompt_set_chunk_name,
     resolve_chunk_optimizer_state,
     resolve_chunk_student_init,
+    should_run_train_compare,
     should_run_train_sample,
+    x_mse_by_cache_source,
 )
+import torch
 
 
 def test_make_chunk_plan_splits_total_samples_from_start_index():
@@ -41,6 +54,99 @@ def test_make_chunk_plan_honors_max_chunks():
         ChunkPlan(chunk_id=0, start_index=0, num_samples=16),
         ChunkPlan(chunk_id=1, start_index=16, num_samples=16),
     ]
+
+
+def test_make_prompt_set_chunk_plan_uses_largest_prompt_set_total():
+    prompt_sets = [
+        {"name": "short", "start_index": 0, "num_samples": 50},
+        {"name": "small", "start_index": 100, "num_samples": 12},
+    ]
+
+    assert make_prompt_set_chunk_plan(prompt_sets=prompt_sets, chunk_size=16, max_chunks=None) == [
+        ChunkPlan(chunk_id=0, start_index=0, num_samples=16),
+        ChunkPlan(chunk_id=1, start_index=16, num_samples=16),
+        ChunkPlan(chunk_id=2, start_index=32, num_samples=16),
+        ChunkPlan(chunk_id=3, start_index=48, num_samples=2),
+    ]
+
+
+def test_make_prompt_set_chunk_plan_counts_repeat():
+    prompt_sets = [
+        {"name": "large", "start_index": 0, "num_samples": 50, "repeat": 1},
+        {"name": "small", "start_index": 0, "num_samples": 10, "repeat": 5},
+    ]
+
+    assert make_prompt_set_chunk_plan(prompt_sets=prompt_sets, chunk_size=16, max_chunks=None)[-1] == ChunkPlan(
+        chunk_id=3,
+        start_index=48,
+        num_samples=2,
+    )
+
+
+def test_prompt_set_slice_for_plan_respects_each_set_start_and_total():
+    prompt_set = {"name": "small", "start_index": 100, "num_samples": 18}
+
+    assert prompt_set_slice_for_plan(prompt_set, ChunkPlan(chunk_id=0, start_index=0, num_samples=16)) == {
+        "name": "small",
+        "start_index": 100,
+        "num_samples": 16,
+        "cache_chunk_offset": 0,
+        "_repeat_cycle": 0,
+    }
+    assert prompt_set_slice_for_plan(prompt_set, ChunkPlan(chunk_id=1, start_index=16, num_samples=16)) == {
+        "name": "small",
+        "start_index": 116,
+        "num_samples": 2,
+        "cache_chunk_offset": 0,
+        "_repeat_cycle": 0,
+    }
+    assert prompt_set_slice_for_plan(prompt_set, ChunkPlan(chunk_id=2, start_index=32, num_samples=16)) is None
+
+
+def test_prompt_set_slices_for_plan_wraps_repeated_set():
+    prompt_set = {"name": "small", "start_index": 100, "num_samples": 10, "repeat": 5}
+
+    assert prompt_set_slices_for_plan(prompt_set, ChunkPlan(chunk_id=0, start_index=8, num_samples=6)) == [
+        {"name": "small", "start_index": 108, "num_samples": 2, "repeat": 5, "cache_chunk_offset": 0, "_repeat_cycle": 0},
+        {"name": "small", "start_index": 100, "num_samples": 4, "repeat": 5, "cache_chunk_offset": 0, "_repeat_cycle": 1},
+    ]
+
+
+def test_link_repeated_prompt_set_cache_reuses_first_cycle_file(tmp_path):
+    prompt_set = {
+        "name": "small",
+        "cache_dir": str(tmp_path / "small"),
+        "start_index": 0,
+        "num_samples": 10,
+        "repeat": 2,
+    }
+    source = tmp_path / "small" / "chunk-0000" / "sample-000000.safetensors"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"cached latent")
+
+    linked, skipped = link_repeated_prompt_set_cache(
+        prompt_set=prompt_set,
+        adjusted={"cache_dir": str(tmp_path / "small" / "chunk-0001"), "start_index": 0, "num_samples": 1},
+        chunk_size=10,
+        seed=0,
+        bucket_enabled=False,
+        width=1024,
+        height=1024,
+        skip_existing=True,
+    )
+
+    target = tmp_path / "small" / "chunk-0001" / "sample-000000.safetensors"
+    assert (linked, skipped) == (1, 0)
+    assert target.read_bytes() == b"cached latent"
+
+
+def test_prompt_set_mix_weights_use_effective_repeated_totals():
+    prompt_sets = [
+        {"name": "large", "num_samples": 50, "repeat": 1},
+        {"name": "small", "num_samples": 10, "repeat": 5},
+    ]
+
+    assert prompt_set_mix_weights(prompt_sets) == [50.0, 50.0]
 
 
 def test_completed_chunk_ids_reads_manifest():
@@ -103,6 +209,13 @@ def test_should_run_train_sample_uses_global_step_offset():
     assert should_run_train_sample(args, 186) is True
 
 
+def test_should_run_train_compare_uses_global_step_offset():
+    args = argparse.Namespace(sample_compare_every_steps=500, global_step_offset=1314)
+
+    assert should_run_train_compare(args, 185) is False
+    assert should_run_train_compare(args, 186) is True
+
+
 def test_planned_chunk_train_steps_sums_auto_steps_across_chunks():
     train_args = argparse.Namespace(
         max_train_steps=None,
@@ -130,6 +243,26 @@ def test_planned_chunk_train_steps_can_multiply_cache_sets():
     plans = [ChunkPlan(chunk_id=0, start_index=0, num_samples=16)]
 
     assert planned_chunk_train_steps(train_args, chunk_args, plans, cache_multiplier=2) == 4
+
+
+def test_planned_prompt_set_train_steps_uses_active_repeated_samples():
+    train_args = argparse.Namespace(
+        max_train_steps=None,
+        train_batch_size=4,
+        gradient_accumulation_steps=2,
+        num_train_epochs=1.0,
+    )
+    chunk_args = argparse.Namespace(train_steps_per_chunk=None)
+    plans = [
+        ChunkPlan(chunk_id=0, start_index=0, num_samples=16),
+        ChunkPlan(chunk_id=1, start_index=16, num_samples=16),
+    ]
+    prompt_sets = [
+        {"name": "large", "num_samples": 32, "repeat": 1},
+        {"name": "small", "num_samples": 8, "repeat": 2},
+    ]
+
+    assert planned_prompt_set_train_steps(train_args, chunk_args, plans, prompt_sets) == 6
 
 
 def test_prompt_set_chunk_offset_maps_sources_to_different_chunk_numbers(tmp_path):
@@ -240,3 +373,63 @@ def test_multi_cache_bucket_cursor_mixes_sources_within_one_resolution(tmp_path)
     assert sum("/a/" in str(path) for path in batch) == 4
     assert sum("/b/" in str(path) for path in batch) == 4
     assert {path.parent.name for path in batch} == {"1024x1024"}
+
+
+def test_cache_source_names_and_indices_support_chunk_dirs(tmp_path):
+    tag = tmp_path / "tag" / "chunk-0014"
+    nl = tmp_path / "nl" / "chunk-0000"
+    tag.mkdir(parents=True)
+    nl.mkdir(parents=True)
+    tag_file = tag / "sample-111000.safetensors"
+    nl_file = nl / "sample-000000.safetensors"
+    tag_file.write_text("tag", encoding="utf-8")
+    nl_file.write_text("nl", encoding="utf-8")
+
+    assert cache_source_name(tag) == "tag"
+    assert cache_source_name(nl) == "nl"
+    assert cache_source_indices_for_paths([tag_file, nl_file], [str(tag), str(nl)]) == [0, 1]
+
+
+def test_loss_by_cache_source_splits_batch_loss():
+    prediction = torch.tensor([[[[1.0]]], [[[3.0]]]])
+    target = torch.tensor([[[[0.0]]], [[[1.0]]]])
+    z = torch.zeros_like(prediction)
+    sigma = torch.ones_like(prediction)
+
+    losses = loss_by_cache_source(
+        prediction_type="x",
+        loss_weighting="none",
+        prediction=prediction,
+        target=target,
+        z=z,
+        sigma=sigma,
+        eps_floor=5e-2,
+        source_indices=[0, 1],
+        source_count=2,
+    )
+
+    assert losses == {0: 1.0, 1: 4.0}
+
+
+def test_prediction_to_x_supports_x_and_v_outputs():
+    z = torch.tensor([[[[5.0]]]])
+    sigma = torch.tensor([[[[0.5]]]])
+    x_pred = torch.tensor([[[[2.0]]]])
+    v_pred = torch.tensor([[[[6.0]]]])
+
+    torch.testing.assert_close(prediction_to_x("x", x_pred, z, sigma), x_pred)
+    torch.testing.assert_close(prediction_to_x("v", v_pred, z, sigma), torch.tensor([[[[2.0]]]]))
+
+
+def test_x_mse_by_cache_source_splits_batch_x_error():
+    x_pred = torch.tensor([[[[1.0]]], [[[3.0]]]])
+    x_target = torch.tensor([[[[0.0]]], [[[1.0]]]])
+
+    losses = x_mse_by_cache_source(
+        x_pred=x_pred,
+        x_target=x_target,
+        source_indices=[0, 1],
+        source_count=2,
+    )
+
+    assert losses == {0: 1.0, 1: 4.0}
