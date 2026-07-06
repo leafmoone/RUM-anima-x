@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import gc
 import json
-import math
-import os
-import random
 import re
 import shutil
 import sys
@@ -31,9 +27,7 @@ from rum_xpred.anima import (
     DEFAULT_TEACHER_CFG,
     DEFAULT_TEACHER_STEPS,
     ToyXPredNet,
-    cache_file_sort_key,
     load_object,
-    load_xpred_cache_sample,
     make_shifted_sigma_schedule,
     make_toy_teacher_endpoint,
     reflow_training_target,
@@ -44,31 +38,54 @@ from rum_xpred.anima import (
     save_xpred_cache_sample,
     xpred_to_anima_v,
 )
-from rum_xpred.config import config_to_namespace, load_toml_config
-
-
-DEFAULT_CACHE_BUCKETS: tuple[tuple[int, int], ...] = (
-    (1024, 1024),
-    (832, 1216),
-    (1216, 832),
-    (896, 1152),
-    (1152, 896),
-    (768, 1344),
-    (1344, 768),
+from rum_xpred.cache_batches import (
+    DEFAULT_CACHE_BUCKETS,
+    CacheBucketBatchCursor,
+    MultiCacheBucketBatchCursor,
+    allocate_weighted_counts,
+    bucket_cache_path,
+    cache_source_indices_for_paths,
+    cache_source_name,
+    chunked,
+    choose_cache_bucket,
+    collect_cache_buckets,
+    loss_by_cache_source,
+    make_seeded_eps_batch,
+    merge_cache_samples,
+    prediction_to_x,
+    prune_checkpoints,
+    read_prompts,
+    reflow_loss,
+    unique_cache_source_names,
+    x_mse_by_cache_source,
 )
-
-
-@dataclasses.dataclass(frozen=True)
-class CacheBucket:
-    name: str
-    files: list[Path]
-
-
-@dataclasses.dataclass(frozen=True)
-class ChunkPlan:
-    chunk_id: int
-    start_index: int
-    num_samples: int
+from rum_xpred.chunking import (
+    ChunkPlan,
+    chunk_cache_dirs_for_prompt_sets,
+    chunk_train_steps,
+    completed_chunk_ids,
+    link_repeated_prompt_set_cache,
+    load_chunk_manifest,
+    make_chunk_plan,
+    make_prompt_set_chunk_plan,
+    normalize_prompt_sets,
+    prompt_set_chunk_name,
+    prompt_set_effective_total,
+    prompt_set_mix_weights,
+    prompt_set_slice_for_plan,
+    prompt_set_slices_for_plan,
+    resolve_chunk_optimizer_state,
+    resolve_chunk_student_init,
+    update_chunk_manifest,
+)
+from rum_xpred.config import config_to_namespace, load_toml_config
+from rum_xpred.train_schedule import (
+    lr_scale_for_step,
+    planned_chunk_train_steps,
+    planned_prompt_set_train_steps,
+    resolve_max_train_steps,
+    set_optimizer_lr,
+)
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -81,417 +98,6 @@ def dtype_from_name(name: str) -> torch.dtype:
     raise ValueError("mixed_precision must be bf16, fp16, or fp32")
 
 
-def read_prompts(path: str | Path, limit: int | None) -> list[str]:
-    prompts = [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
-    if limit is not None:
-        prompts = prompts[:limit]
-    if not prompts:
-        raise ValueError(f"no prompts found in {path}")
-    return prompts
-
-
-def chunked(items: list, batch_size: int):
-    if batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
-    for start in range(0, len(items), batch_size):
-        yield items[start : start + batch_size]
-
-
-def make_seeded_eps_batch(
-    sample_indices: list[int],
-    *,
-    seed: int,
-    height: int,
-    width: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    latents = []
-    for sample_index in sample_indices:
-        generator = torch.Generator(device=device).manual_seed(seed + sample_index)
-        latents.append(
-            torch.randn(
-                1,
-                16,
-                height // 8,
-                width // 8,
-                device=device,
-                dtype=dtype,
-                generator=generator,
-            )
-        )
-    return torch.cat(latents, dim=0)
-
-
-def choose_cache_bucket(sample_index: int, seed: int) -> tuple[int, int]:
-    rng = random.Random((int(seed) << 32) + int(sample_index))
-    return DEFAULT_CACHE_BUCKETS[rng.randrange(len(DEFAULT_CACHE_BUCKETS))]
-
-
-def bucket_name(width: int, height: int) -> str:
-    return f"{int(width)}x{int(height)}"
-
-
-def bucket_cache_path(cache_dir: Path, sample_index: int, *, width: int, height: int, bucket_enabled: bool) -> Path:
-    filename = f"sample-{sample_index:06d}.safetensors"
-    if not bucket_enabled:
-        return cache_dir / filename
-    return cache_dir / bucket_name(width, height) / filename
-
-
-def collect_cache_buckets(cache_dir: str | Path) -> list[CacheBucket]:
-    root = Path(cache_dir)
-    buckets: list[CacheBucket] = []
-    root_files = sorted(root.glob("*.safetensors"), key=cache_file_sort_key)
-    if root_files:
-        buckets.append(CacheBucket(name="root", files=root_files))
-    for child in sorted(root.iterdir() if root.exists() else [], key=lambda path: path.name):
-        if not child.is_dir():
-            continue
-        files = sorted(child.glob("*.safetensors"), key=cache_file_sort_key)
-        if files:
-            buckets.append(CacheBucket(name=child.name, files=files))
-    return buckets
-
-
-def merge_cache_samples(paths: list[Path], device: torch.device, dtype: torch.dtype) -> dict:
-    samples = [load_xpred_cache_sample(path, device=device, dtype=dtype) for path in paths]
-    shapes = {tuple(sample["x_teacher_latent"].shape[1:]) for sample in samples}
-    if len(shapes) != 1:
-        raise ValueError(f"mixed latent shapes in one train batch are not supported: {sorted(shapes)}")
-    text_keys = set(samples[0]["text_conditioning"])
-    if any(set(sample["text_conditioning"]) != text_keys for sample in samples):
-        raise ValueError("all samples in a train batch must have the same text conditioning keys")
-    return {
-        "x_teacher_latent": torch.cat([sample["x_teacher_latent"] for sample in samples], dim=0),
-        "eps_latent": torch.cat([sample["eps_latent"] for sample in samples], dim=0),
-        "text_conditioning": {
-            key: torch.cat([sample["text_conditioning"][key] for sample in samples], dim=0)
-            for key in text_keys
-        },
-    }
-
-
-def cache_source_name(cache_dir: str | Path) -> str:
-    path = Path(cache_dir)
-    name = path.parent.name if path.name.startswith("chunk-") and path.parent.name else path.name
-    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in name)
-    return safe or "cache"
-
-
-def unique_cache_source_names(cache_dirs: list[str]) -> list[str]:
-    counts: dict[str, int] = {}
-    names: list[str] = []
-    for cache_dir in cache_dirs:
-        base = cache_source_name(cache_dir)
-        count = counts.get(base, 0)
-        counts[base] = count + 1
-        names.append(base if count == 0 else f"{base}_{count + 1}")
-    return names
-
-
-def cache_source_indices_for_paths(paths: list[Path], cache_dirs: list[str]) -> list[int]:
-    roots = [Path(cache_dir).resolve() for cache_dir in cache_dirs]
-    indices: list[int] = []
-    for path in paths:
-        resolved = path.resolve()
-        for index, root in enumerate(roots):
-            try:
-                resolved.relative_to(root)
-            except ValueError:
-                continue
-            indices.append(index)
-            break
-        else:
-            raise ValueError(f"cache sample path does not belong to any cache_dir: {path}")
-    return indices
-
-
-@torch.no_grad()
-def loss_by_cache_source(
-    *,
-    prediction_type: str,
-    loss_weighting: str,
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    z: torch.Tensor,
-    sigma: torch.Tensor,
-    eps_floor: float,
-    source_indices: list[int],
-    source_count: int,
-) -> dict[int, float]:
-    losses: dict[int, float] = {}
-    if not source_indices:
-        return losses
-    source_tensor = torch.tensor(source_indices, device=prediction.device)
-    for source_index in range(source_count):
-        mask = source_tensor == source_index
-        if not bool(mask.any()):
-            continue
-        losses[source_index] = float(
-            reflow_loss(
-                prediction_type,
-                loss_weighting,
-                prediction.detach()[mask],
-                target.detach()[mask],
-                z.detach()[mask],
-                sigma.detach()[mask],
-                eps_floor,
-            ).detach()
-        )
-    return losses
-
-
-def prediction_to_x(
-    prediction_type: str,
-    prediction: torch.Tensor,
-    z: torch.Tensor,
-    sigma: torch.Tensor,
-) -> torch.Tensor:
-    if prediction_type == "x":
-        return prediction
-    if prediction_type == "v":
-        return z - sigma * prediction
-    raise ValueError(f"unsupported prediction_type: {prediction_type!r}")
-
-
-@torch.no_grad()
-def x_mse_by_cache_source(
-    *,
-    x_pred: torch.Tensor,
-    x_target: torch.Tensor,
-    source_indices: list[int],
-    source_count: int,
-) -> dict[int, float]:
-    losses: dict[int, float] = {}
-    if not source_indices:
-        return losses
-    source_tensor = torch.tensor(source_indices, device=x_pred.device)
-    for source_index in range(source_count):
-        mask = source_tensor == source_index
-        if not bool(mask.any()):
-            continue
-        losses[source_index] = float(torch.nn.functional.mse_loss(x_pred.detach()[mask].float(), x_target.detach()[mask].float()).detach())
-    return losses
-
-
-class CacheBatchCursor:
-    def __init__(self, cache_files: list[Path], batch_size: int, *, shuffle: bool, seed: int, drop_last: bool) -> None:
-        if batch_size < 1:
-            raise ValueError("train_batch_size must be >= 1")
-        self.cache_files = list(cache_files)
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self.rng = random.Random(seed)
-        self.position = 0
-        if self.shuffle:
-            self.rng.shuffle(self.cache_files)
-
-    def next_count(self, count: int) -> list[Path]:
-        if count < 1:
-            return []
-        selected = []
-        while len(selected) < count:
-            remaining = len(self.cache_files) - self.position
-            need = count - len(selected)
-            take = min(remaining, need)
-            if take:
-                selected.extend(self.cache_files[self.position : self.position + take])
-                self.position += take
-            if len(selected) == count:
-                return selected
-            self.position = 0
-            if self.shuffle:
-                self.rng.shuffle(self.cache_files)
-            if self.drop_last and selected:
-                selected = []
-        return selected
-
-    def next(self) -> list[Path]:
-        return self.next_count(self.batch_size)
-
-
-class CacheBucketBatchCursor:
-    def __init__(self, buckets: list[CacheBucket], batch_size: int, *, shuffle: bool, seed: int, drop_last: bool) -> None:
-        if not buckets:
-            raise ValueError("at least one cache bucket is required")
-        self.cursors = [
-            CacheBatchCursor(bucket.files, batch_size, shuffle=shuffle, seed=seed + index, drop_last=drop_last)
-            for index, bucket in enumerate(buckets)
-        ]
-        self.rng = random.Random(seed)
-        self.shuffle = shuffle
-        self.position = 0
-        self.order = list(range(len(self.cursors)))
-        if self.shuffle:
-            self.rng.shuffle(self.order)
-
-    def next(self) -> list[Path]:
-        if self.shuffle:
-            index = self.rng.randrange(len(self.cursors))
-            return self.cursors[index].next()
-        index = self.order[self.position]
-        self.position = (self.position + 1) % len(self.order)
-        return self.cursors[index].next()
-
-
-def allocate_weighted_counts(batch_size: int, weights: list[float]) -> list[int]:
-    if batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
-    if not weights:
-        raise ValueError("at least one weight is required")
-    if any(weight < 0 for weight in weights) or sum(weights) <= 0:
-        raise ValueError("cache mix weights must be non-negative and sum to > 0")
-    total = float(sum(weights))
-    raw = [batch_size * float(weight) / total for weight in weights]
-    counts = [int(math.floor(value)) for value in raw]
-    remaining = batch_size - sum(counts)
-    order = sorted(range(len(weights)), key=lambda index: raw[index] - counts[index], reverse=True)
-    for index in order[:remaining]:
-        counts[index] += 1
-    return counts
-
-
-class MultiCacheBucketBatchCursor:
-    def __init__(
-        self,
-        cache_bucket_sets: list[list[CacheBucket]],
-        batch_size: int,
-        *,
-        weights: list[float] | None,
-        shuffle: bool,
-        seed: int,
-        drop_last: bool,
-    ) -> None:
-        if len(cache_bucket_sets) < 2:
-            raise ValueError("multi cache cursor requires at least two cache dirs")
-        if batch_size < 1:
-            raise ValueError("train_batch_size must be >= 1")
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.rng = random.Random(seed)
-        if weights is None:
-            weights = [1.0] * len(cache_bucket_sets)
-        if len(weights) != len(cache_bucket_sets):
-            raise ValueError("cache_mix_weights length must match cache_dirs length")
-        self.weights = [float(weight) for weight in weights]
-        if any(weight < 0 for weight in self.weights) or sum(self.weights) <= 0:
-            raise ValueError("cache_mix_weights must be non-negative and sum to > 0")
-
-        bucket_names = sorted({bucket.name for buckets in cache_bucket_sets for bucket in buckets})
-        self.bucket_groups: list[tuple[str, list[tuple[int, CacheBatchCursor]]]] = []
-        for bucket_name in bucket_names:
-            source_cursors: list[tuple[int, CacheBatchCursor]] = []
-            for source_index, buckets in enumerate(cache_bucket_sets):
-                bucket = next((candidate for candidate in buckets if candidate.name == bucket_name), None)
-                if bucket is None:
-                    continue
-                source_cursors.append(
-                    (
-                        source_index,
-                        CacheBatchCursor(
-                            bucket.files,
-                            batch_size,
-                            shuffle=shuffle,
-                            seed=seed + source_index * 1009 + len(self.bucket_groups),
-                            drop_last=drop_last,
-                        ),
-                    )
-                )
-            if source_cursors:
-                self.bucket_groups.append((bucket_name, source_cursors))
-        if not self.bucket_groups:
-            raise ValueError("no shared cache buckets found across cache dirs")
-        self.position = 0
-        self.order = list(range(len(self.bucket_groups)))
-        if self.shuffle:
-            self.rng.shuffle(self.order)
-
-    def next(self) -> list[Path]:
-        if self.shuffle:
-            group_index = self.rng.randrange(len(self.bucket_groups))
-        else:
-            group_index = self.order[self.position]
-            self.position = (self.position + 1) % len(self.order)
-        _, source_cursors = self.bucket_groups[group_index]
-        source_indices = [source_index for source_index, _ in source_cursors]
-        weights = [self.weights[source_index] for source_index in source_indices]
-        counts = allocate_weighted_counts(self.batch_size, weights)
-        selected: list[Path] = []
-        for count, (_, cursor) in zip(counts, source_cursors):
-            selected.extend(cursor.next_count(count))
-        if self.shuffle:
-            self.rng.shuffle(selected)
-        return selected
-
-
-def prune_checkpoints(output_dir: Path, keep: int | None, *, prediction_type: str = "x") -> None:
-    if keep is None or keep < 1:
-        return
-    checkpoints = sorted(output_dir.glob(f"{prediction_type}pred-checkpoint-step-*.safetensors"), key=cache_file_sort_key)
-    for path in checkpoints[:-keep]:
-        path.unlink()
-
-
-def lr_scale_for_step(args: argparse.Namespace, step: int) -> float:
-    if step < 1:
-        raise ValueError("step is 1-indexed and must be >= 1")
-    if args.lr_warmup_steps > 0 and step <= args.lr_warmup_steps:
-        return step / args.lr_warmup_steps
-    if args.lr_scheduler == "constant":
-        return 1.0
-    if args.lr_scheduler == "cosine":
-        total_steps = args.lr_scheduler_total_steps or getattr(args, "resolved_max_train_steps", None) or args.max_train_steps
-        decay_steps = max(total_steps - args.lr_warmup_steps, 1)
-        decay_step = min(max(step - args.lr_warmup_steps, 0), decay_steps)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_step / decay_steps))
-        return args.lr_cosine_min + (1.0 - args.lr_cosine_min) * cosine
-    raise ValueError(f"unsupported lr_scheduler: {args.lr_scheduler}")
-
-
-def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = lr
-
-
-def resolve_max_train_steps(args: argparse.Namespace, cache_sample_count: int) -> int:
-    if args.max_train_steps is not None:
-        return args.max_train_steps
-    effective_batch_size = args.train_batch_size * args.gradient_accumulation_steps
-    steps_per_epoch = math.ceil(cache_sample_count / effective_batch_size)
-    return max(1, math.ceil(steps_per_epoch * args.num_train_epochs))
-
-
-def planned_chunk_train_steps(
-    train_args: argparse.Namespace,
-    chunk_args: argparse.Namespace,
-    plans: list[ChunkPlan],
-    *,
-    cache_multiplier: int = 1,
-) -> int:
-    if chunk_args.train_steps_per_chunk is not None:
-        return chunk_args.train_steps_per_chunk * len(plans)
-    if train_args.max_train_steps is not None:
-        return train_args.max_train_steps * len(plans)
-    return sum(resolve_max_train_steps(train_args, plan.num_samples * cache_multiplier) for plan in plans)
-
-
-def planned_prompt_set_train_steps(train_args: argparse.Namespace, chunk_args: argparse.Namespace, plans: list[ChunkPlan], prompt_sets: list[dict]) -> int:
-    if chunk_args.train_steps_per_chunk is not None:
-        return chunk_args.train_steps_per_chunk * len(plans)
-    if train_args.max_train_steps is not None:
-        return train_args.max_train_steps * len(plans)
-    total = 0
-    for plan in plans:
-        cache_sample_count = 0
-        for prompt_set in prompt_sets:
-            remaining = prompt_set_effective_total(prompt_set) - plan.start_index
-            if remaining > 0:
-                cache_sample_count += min(plan.num_samples, remaining)
-        if cache_sample_count > 0:
-            total += resolve_max_train_steps(train_args, cache_sample_count)
-    return total
 
 
 def enable_model_gradient_checkpointing(student: torch.nn.Module, args: argparse.Namespace) -> None:
@@ -658,26 +264,6 @@ def read_wandb_external_metrics(path: str | None) -> dict[str, float]:
     return metrics
 
 
-def reflow_loss(
-    prediction_type: str,
-    loss_weighting: str,
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    z: torch.Tensor,
-    sigma: torch.Tensor,
-    eps_floor: float,
-) -> torch.Tensor:
-    if loss_weighting == "none":
-        return torch.nn.functional.mse_loss(prediction.float(), target.float())
-    if loss_weighting == "jlt_velocity_readout":
-        if prediction_type != "x":
-            raise ValueError("loss_weighting='jlt_velocity_readout' is only valid with prediction_type='x'")
-        v_pred = xpred_to_anima_v(z.float(), prediction.float(), sigma.float(), eps_floor)
-        v_target = xpred_to_anima_v(z.float(), target.float(), sigma.float(), eps_floor)
-        return torch.nn.functional.mse_loss(v_pred, v_target)
-    raise ValueError(f"unsupported loss_weighting: {loss_weighting!r}")
-
-
 def serializable_args(args: argparse.Namespace) -> dict:
     out = {}
     for key, value in vars(args).items():
@@ -690,265 +276,6 @@ def serializable_args(args: argparse.Namespace) -> dict:
         elif isinstance(value, list) and all(isinstance(item, (str, int, float, bool, type(None))) for item in value):
             out[key] = value
     return out
-
-
-def make_chunk_plan(
-    *,
-    start_index: int,
-    total_samples: int,
-    chunk_size: int,
-    max_chunks: int | None,
-) -> list[ChunkPlan]:
-    if total_samples < 1:
-        raise ValueError("total_samples must be >= 1")
-    if chunk_size < 1:
-        raise ValueError("chunk_size must be >= 1")
-    remaining = total_samples
-    plans: list[ChunkPlan] = []
-    chunk_id = 0
-    current_index = start_index
-    while remaining > 0 and (max_chunks is None or chunk_id < max_chunks):
-        num_samples = min(chunk_size, remaining)
-        plans.append(ChunkPlan(chunk_id=chunk_id, start_index=current_index, num_samples=num_samples))
-        current_index += num_samples
-        remaining -= num_samples
-        chunk_id += 1
-    return plans
-
-
-def make_prompt_set_chunk_plan(
-    *,
-    prompt_sets: list[dict],
-    chunk_size: int,
-    max_chunks: int | None,
-) -> list[ChunkPlan]:
-    if chunk_size < 1:
-        raise ValueError("chunk_size must be >= 1")
-    totals = []
-    for index, prompt_set in enumerate(prompt_sets):
-        num_samples = prompt_set.get("num_samples")
-        if num_samples is None:
-            raise ValueError(f"prompt_sets[{index}] requires num_samples when chunked_rum.total_samples is omitted")
-        totals.append(int(num_samples) * int(prompt_set.get("repeat", 1)))
-    total_samples = max(totals) if totals else 0
-    return make_chunk_plan(start_index=0, total_samples=total_samples, chunk_size=chunk_size, max_chunks=max_chunks)
-
-
-def prompt_set_effective_total(prompt_set: dict) -> int:
-    set_total = prompt_set.get("num_samples")
-    if set_total is None:
-        raise ValueError(f"prompt set {prompt_set.get('name', '<unnamed>')} requires num_samples")
-    return int(set_total) * int(prompt_set.get("repeat", 1))
-
-
-def prompt_set_slices_for_plan(prompt_set: dict, plan: ChunkPlan) -> list[dict]:
-    set_start = int(prompt_set.get("start_index", 0))
-    set_total = prompt_set.get("num_samples")
-    if set_total is None:
-        raise ValueError(f"prompt set {prompt_set.get('name', '<unnamed>')} requires num_samples")
-    set_total = int(set_total)
-    effective_total = prompt_set_effective_total(prompt_set)
-    effective_offset = plan.start_index
-    remaining = effective_total - effective_offset
-    if remaining <= 0:
-        return []
-    to_take = min(plan.num_samples, remaining)
-    slices: list[dict] = []
-    while to_take > 0:
-        offset_in_set = effective_offset % set_total
-        repeat_cycle = effective_offset // set_total
-        take = min(to_take, set_total - offset_in_set)
-        adjusted = dict(prompt_set)
-        adjusted["start_index"] = set_start + offset_in_set
-        adjusted["num_samples"] = take
-        adjusted["cache_chunk_offset"] = 0
-        adjusted["_repeat_cycle"] = repeat_cycle
-        slices.append(adjusted)
-        effective_offset += take
-        to_take -= take
-    return slices
-
-
-def prompt_set_slice_for_plan(prompt_set: dict, plan: ChunkPlan) -> dict | None:
-    slices = prompt_set_slices_for_plan(prompt_set, plan)
-    return slices[0] if slices else None
-
-
-def load_chunk_manifest(path: Path) -> dict:
-    if not path.exists():
-        return {"chunks": []}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or not isinstance(data.get("chunks"), list):
-        raise ValueError(f"invalid chunk manifest: {path}")
-    return data
-
-
-def write_chunk_manifest(path: Path, manifest: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def update_chunk_manifest(path: Path, plan: ChunkPlan, **values) -> None:
-    manifest = load_chunk_manifest(path)
-    chunks = manifest.setdefault("chunks", [])
-    existing = next((chunk for chunk in chunks if chunk.get("chunk_id") == plan.chunk_id), None)
-    if existing is None:
-        existing = {
-            "chunk_id": plan.chunk_id,
-            "start_index": plan.start_index,
-            "num_samples": plan.num_samples,
-        }
-        chunks.append(existing)
-    else:
-        existing["start_index"] = plan.start_index
-        existing["num_samples"] = plan.num_samples
-    existing.update(values)
-    write_chunk_manifest(path, manifest)
-
-
-def completed_chunk_ids(manifest: dict) -> set[int]:
-    return {
-        int(chunk["chunk_id"])
-        for chunk in manifest.get("chunks", [])
-        if isinstance(chunk, dict) and chunk.get("status") == "complete" and "chunk_id" in chunk
-    }
-
-
-def chunk_train_steps(chunk: dict, fallback_output_dir: Path | None, previous_chunk: dict | None = None) -> int:
-    value = chunk.get("train_steps")
-    if isinstance(value, int) and value >= 0:
-        return value
-    total_completed_steps = chunk.get("total_completed_steps")
-    if isinstance(total_completed_steps, int) and total_completed_steps >= 0:
-        previous_total = previous_chunk.get("total_completed_steps") if previous_chunk else None
-        if isinstance(previous_total, int) and 0 <= previous_total <= total_completed_steps:
-            return total_completed_steps - previous_total
-    output_dir = Path(chunk.get("output_dir") or fallback_output_dir)
-    summary_path = output_dir / "train-summary.json"
-    if not summary_path.exists():
-        return 0
-    try:
-        data = json.loads(summary_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return 0
-    losses = data.get("losses", [])
-    return len(losses) if isinstance(losses, list) else 0
-
-
-def resolve_chunk_student_init(args: argparse.Namespace, previous_checkpoint: str | None) -> str | None:
-    return previous_checkpoint or args.student_init
-
-
-def resolve_chunk_optimizer_state(args: argparse.Namespace, previous_optimizer_state: str | None) -> str | None:
-    return previous_optimizer_state or getattr(args, "optimizer_state", None)
-
-
-def normalize_prompt_sets(args: argparse.Namespace) -> list[dict] | None:
-    prompt_sets = getattr(args, "prompt_sets", None)
-    if not prompt_sets:
-        return None
-    if not isinstance(prompt_sets, list):
-        raise ValueError("prompt_sets must be a list of tables")
-    normalized: list[dict] = []
-    for index, prompt_set in enumerate(prompt_sets):
-        if not isinstance(prompt_set, dict):
-            raise ValueError("each prompt_sets entry must be a table")
-        prompts = prompt_set.get("prompts")
-        cache_dir = prompt_set.get("cache_dir")
-        if not prompts or not cache_dir:
-            raise ValueError(f"prompt_sets[{index}] requires prompts and cache_dir")
-        normalized.append(
-            {
-                "name": prompt_set.get("name") or f"set-{index}",
-                "prompts": prompts,
-                "cache_dir": cache_dir,
-                "start_index": int(prompt_set.get("start_index", getattr(args, "start_index", 0))),
-                "num_samples": prompt_set.get("num_samples", getattr(args, "num_samples", None)),
-                "cache_chunk_offset": int(prompt_set.get("cache_chunk_offset", 0)),
-                "repeat": int(prompt_set.get("repeat", 1)),
-            }
-        )
-        if normalized[-1]["repeat"] < 1:
-            raise ValueError(f"prompt_sets[{index}].repeat must be >= 1")
-    return normalized
-
-
-def prompt_set_mix_weights(prompt_sets: list[dict]) -> list[float]:
-    return [float(prompt_set_effective_total(prompt_set)) for prompt_set in prompt_sets]
-
-
-def prompt_set_chunk_name(prompt_set: dict, training_chunk_id: int) -> str:
-    return f"chunk-{training_chunk_id + int(prompt_set.get('cache_chunk_offset', 0)):04d}"
-
-
-def link_or_symlink_cache_file(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(source, target)
-    except OSError:
-        try:
-            target.symlink_to(source)
-        except OSError:
-            shutil.copy2(source, target)
-
-
-def link_repeated_prompt_set_cache(
-    *,
-    prompt_set: dict,
-    adjusted: dict,
-    chunk_size: int,
-    seed: int,
-    bucket_enabled: bool,
-    width: int,
-    height: int,
-    skip_existing: bool,
-) -> tuple[int, int]:
-    base_start = int(prompt_set.get("start_index", 0))
-    base_cache_dir = Path(prompt_set["cache_dir"])
-    dst_cache_dir = Path(adjusted["cache_dir"])
-    linked = 0
-    skipped = 0
-    for sample_index in range(int(adjusted["start_index"]), int(adjusted["start_index"]) + int(adjusted["num_samples"])):
-        offset = sample_index - base_start
-        if offset < 0:
-            raise ValueError(f"repeat sample index {sample_index} is before prompt set start_index {base_start}")
-        source_chunk_id = offset // chunk_size
-        source_cache_dir = base_cache_dir / prompt_set_chunk_name(prompt_set, source_chunk_id)
-        if bucket_enabled:
-            sample_width, sample_height = choose_cache_bucket(sample_index, seed)
-        else:
-            sample_width, sample_height = width, height
-        source = bucket_cache_path(
-            source_cache_dir,
-            sample_index,
-            width=sample_width,
-            height=sample_height,
-            bucket_enabled=bucket_enabled,
-        )
-        target = bucket_cache_path(
-            dst_cache_dir,
-            sample_index,
-            width=sample_width,
-            height=sample_height,
-            bucket_enabled=bucket_enabled,
-        )
-        if skip_existing and target.exists():
-            skipped += 1
-            continue
-        if not source.exists():
-            raise FileNotFoundError(
-                f"repeat cache source is missing: {source}. "
-                "Run earlier chunks first or disable repeat for this prompt set."
-            )
-        if target.exists():
-            target.unlink()
-        link_or_symlink_cache_file(source, target)
-        linked += 1
-    return linked, skipped
-
-
-def chunk_cache_dirs_for_prompt_sets(prompt_sets: list[dict], training_chunk_id: int) -> list[str]:
-    return [str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, training_chunk_id)) for prompt_set in prompt_sets]
 
 
 def make_stage_args(config_path: str, command: str) -> argparse.Namespace:
@@ -1785,6 +1112,9 @@ def train_xpred(args: argparse.Namespace) -> None:
         for step in range(resolved_max_train_steps):
             global_step = step + 1
             total_step = getattr(args, "global_step_offset", 0) + global_step
+            should_log_console = global_step % args.log_every == 0
+            should_log_wandb = wandb_run is not None
+            should_compute_source_metrics = bool(cache_dirs) and (should_log_console or should_log_wandb)
             current_lr = args.learning_rate * lr_scale_for_step(args, total_step)
             set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
@@ -1827,7 +1157,7 @@ def train_xpred(args: argparse.Namespace) -> None:
                 x_prediction = prediction_to_x(args.prediction_type, prediction, z, sigma)
                 x_mse = torch.nn.functional.mse_loss(x_prediction.detach().float(), sample["x_teacher_latent"].detach().float())
                 micro_x_mses.append(float(x_mse.detach()))
-                if cache_dirs:
+                if should_compute_source_metrics:
                     for source_index, source_loss in loss_by_cache_source(
                         prediction_type=args.prediction_type,
                         loss_weighting=args.loss_weighting,
@@ -1885,10 +1215,10 @@ def train_xpred(args: argparse.Namespace) -> None:
                     wandb_metrics[f"train/loss_by_cache/{name}"] = float(source_loss)
                 for name, source_x_mse in source_x_mses.items():
                     wandb_metrics[f"train/x_mse_by_cache/{name}"] = float(source_x_mse)
-                if args.wandb_metrics_log_every > 0 and global_step % args.wandb_metrics_log_every == 0:
-                    wandb_metrics.update(read_wandb_external_metrics(args.wandb_metrics_file))
-                wandb_run.log(wandb_metrics, step=total_step)
-            if global_step % args.log_every == 0:
+                    if args.wandb_metrics_log_every > 0 and global_step % args.wandb_metrics_log_every == 0:
+                        wandb_metrics.update(read_wandb_external_metrics(args.wandb_metrics_file))
+                    wandb_run.log(wandb_metrics, step=total_step)
+            if should_log_console:
                 grad_text = "" if grad_norm is None else f" grad_norm={float(grad_norm):.6f}"
                 offset_text = "" if getattr(args, "global_step_offset", 0) == 0 else f" total_step={total_step}"
                 source_text = ""
