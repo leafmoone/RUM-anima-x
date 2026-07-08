@@ -3,16 +3,16 @@
 All commands assume:
 
 ```bash
-cd /root/shared-nvme/RUM-anima-xpred
+cd .
 ```
 
-Do not run this project from `/root/shared-nvme/RUM`. That is a separate workspace. The Anima x-pred project is intended to be standalone; use the scripts and vendored code inside `/root/shared-nvme/RUM-anima-xpred`.
+Run commands from the repository root so relative config paths resolve inside the project.
 
 For agent-to-agent continuity, read the root-level `agent.md` before changing code or config.
 
-## 0. Current Workspace State
+## 0. Workspace State
 
-`configs/anima_xpred.example.toml` is the active experiment config in this workspace. It contains real model paths, chunk state, W&B run settings, LoRA settings, and sample/compare settings. Treat it as live state, not a disposable template.
+`configs/anima_xpred.example.toml` is a publishable template. Keep machine-specific paths, run state, and private overrides in ignored local configs such as `configs/train.local.toml`.
 
 Before making operational changes, check for a running training process:
 
@@ -35,7 +35,7 @@ pytest -q
 Use `configs/anima_xpred.example.toml` as the main editable config. It contains every normal option for all three stages:
 
 - `[common]`: shared device, precision, Anima model paths, adapter, seed, attention mode, and FP8/text-encoder placement flags.
-- `[wandb]`: optional wandb logging settings. It is disabled by default; set `wandb_enabled = true` and use `wandb_mode = "offline"` for local-only logging. `train/grad_norm` is logged directly by the trainer; FID/IS are read from `wandb_metrics_file` when an external image evaluator writes JSON such as `{"fid": 12.3, "is": 5.6}`.
+- Optional tracker fields are disabled by default. `train/grad_norm` is logged directly by the trainer; FID/IS can be read from a local metrics JSON file when a local evaluator writes values such as `{"fid": 12.3, "is": 5.6}`.
 - `[build_cache]`: prompt file, cache directory, start index, cache batch size, skip-existing resume behavior, resolution, teacher steps, teacher CFG.
 - `[train_xpred]`: cache directory, output directory, `prediction_type`, epoch/step count, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, sigma lower bound, shuffle/drop-last, logging interval, periodic checkpoints, gradient checkpointing, optional training-time sampling, dry run. If `max_train_steps` is omitted, steps are computed from `num_train_epochs`, cache sample count, and effective batch size.
 - `[sample_xpred]`: checkpoint, `prediction_type`, latent output path, prompt, sample count, sampler steps, resolution, epsilon floor.
@@ -57,12 +57,12 @@ python scripts/dev/anima_rum_xpred_train.py sample_compare --config configs/anim
 python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
 ```
 
-For the current machine, the example already points at:
+The example uses project-relative model paths:
 
 ```text
-/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors
-/root/shared-nvme/anima/split_files/text_encoders/qwen_3_06b_base.safetensors
-/root/shared-nvme/anima/split_files/vae/qwen_image_vae.safetensors
+models/anima/diffusion_models/anima-base-v1.0.safetensors
+models/anima/text_encoders/qwen_3_06b_base.safetensors
+models/anima/vae/qwen_image_vae.safetensors
 ```
 
 ## 3. Toy Smoke
@@ -75,20 +75,20 @@ toy_smoke = true
 mixed_precision = "fp32"
 
 [build_cache]
-cache_dir = "/tmp/rum-anima-xpred-cache-smoke"
+cache_dir = "outputs/toy-smoke/cache"
 num_samples = 2
 width = 64
 height = 64
 
 [train_xpred]
-cache_dir = "/tmp/rum-anima-xpred-cache-smoke"
-output_dir = "/tmp/rum-anima-xpred-train-smoke"
+cache_dir = "outputs/toy-smoke/cache"
+output_dir = "outputs/toy-smoke/train"
 max_train_steps = 3
 learning_rate = 1e-4
 
 [sample_xpred]
-checkpoint = "/tmp/rum-anima-xpred-train-smoke/xpred-toy-smoke.pt"
-output = "/tmp/rum-anima-xpred-train-smoke/sample-latent.pt"
+checkpoint = "outputs/toy-smoke/train/xpred-toy-smoke.pt"
+output = "outputs/toy-smoke/train/sample-latent.pt"
 width = 64
 height = 64
 steps = 4
@@ -124,9 +124,9 @@ The current example config uses the Anima Turbo LoRA as a 10-step teacher:
 
 ```toml
 [build_cache]
-cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+cache_dir = "cache_data/anima-xpred-turbo10-cache"
 teacher_steps = 10
-teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
+teacher_lora = "models/anima/anima-turbo-lora-v0.2.safetensors"
 teacher_lora_weight = 1.0
 ```
 
@@ -154,8 +154,8 @@ Multiple prompt files can be cached into separate directories with `[[build_cach
 ```toml
 [[build_cache.prompt_sets]]
 name = "tag"
-prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
-cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/tag"
+prompts = "data/prompts/qat_prompts.txt"
+cache_dir = "./cache_mix/tag"
 start_index = 177000
 num_samples = 50000
 repeat = 1
@@ -163,8 +163,8 @@ cache_chunk_offset = 14
 
 [[build_cache.prompt_sets]]
 name = "short_nl"
-prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
-cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl"
+prompts = "data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
+cache_dir = "./cache_mix/short_nl"
 start_index = 0
 num_samples = 50000
 repeat = 1
@@ -201,7 +201,7 @@ Each next chunk uses the previous chunk's final student checkpoint as `student_i
 
 ```toml
 [chunked_rum]
-chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-chunks"
+chunk_root = "./anima-xpred-chunks"
 total_samples = 30000
 chunk_size = 1024
 resume = true
@@ -249,14 +249,14 @@ cache_mix_weights = [0.5, 0.5]
 
 The trainer draws each micro-batch from one resolution bucket and splits samples across cache directories according to the weights. With `train_batch_size = 8` and weights `[0.5, 0.5]`, each micro-batch contains four samples from each directory when both have the selected bucket.
 
-Training always logs `train/x_mse`, the clean-latent MSE against `x_teacher_latent`, even when the active training objective is JLT velocity-readout loss. When multiple cache directories are active, wandb also logs `train/loss_by_cache/<cache-name>` and `train/x_mse_by_cache/<cache-name>`. For chunked paths such as `tag/chunk-0014`, the cache name is `tag`.
+Training always logs `train/x_mse`, the clean-latent MSE against `x_teacher_latent`, even when the active training objective is JLT velocity-readout loss. When multiple cache directories are active, the tracker payload also includes `train/loss_by_cache/<cache-name>` and `train/x_mse_by_cache/<cache-name>`. For chunked paths such as `tag/chunk-0014`, the cache name is `tag`.
 
 The student starts from `[common].student_init`; if that is empty, it falls back to `[common].dit`.
 
 Default output:
 
 ```text
-/tmp/anima-xpred-train/xpred-adapter-checkpoint.safetensors
+outputs/anima-xpred-train/xpred-adapter-checkpoint.safetensors
 ```
 
 Training-time sampling is off by default:
@@ -277,7 +277,6 @@ sample_num_samples = 2
 sample_cfg = 1.0
 sample_eps_floor = 1e-4
 sample_decode_images = true
-sample_wandb_log_images = true
 ```
 
 Latents are always saved to:
@@ -296,7 +295,7 @@ For ordinary `train_xpred`, the interval is counted from step 1. For `chunked_ru
 
 If `lr_scheduler_total_steps` is omitted in `chunked_rum`, the script estimates the optimizer-step total for all planned chunks and uses that for cosine decay. This keeps warmup and decay continuous across chunks instead of restarting at each chunk.
 
-When `wandb_enabled = true`, `sample_decode_images = true`, and `sample_wandb_log_images = true`, those PNGs are logged to wandb as `sample/images` at the total training step. Toy smoke saves latent previews only; image decode requires the real Anima VAE.
+Toy smoke saves latent previews only; image decode requires the real Anima VAE.
 
 The ordinary training sample can also generate a separate LoRA branch. Its CFG is configured independently from the non-LoRA branch:
 
@@ -331,7 +330,6 @@ sample_compare_lora = "__inherit__"
 sample_compare_lora_weight = 1.0
 sample_compare_lora_cfg = 1.0
 sample_compare_decode_images = true
-sample_compare_wandb_log_images = true
 ```
 
 This path runs the current in-memory student in multiple interpretations:
@@ -354,17 +352,14 @@ Outputs are saved under:
 <output_dir>/train-compare-samples/step-000000/
 ```
 
-If `wandb_enabled = true`, `sample_compare_decode_images = true`, and `sample_compare_wandb_log_images = true`, the compare PNGs are also logged to wandb `sample_compare/images` at the same total training step. It currently requires `prediction_type = "x"`.
-
-Teacher baseline images do not need to be regenerated every compare interval. To import an already generated `alpha-0` directory once and upload it to wandb:
+Teacher baseline images do not need to be regenerated every compare interval. To import an already generated `alpha-0` directory once:
 
 ```toml
 [train_xpred]
 sample_compare_baseline_source_dir = "/path/to/train-compare-samples/step-002180/images/alpha-0"
-sample_compare_baseline_wandb_log_images = true
 ```
 
-Those images are imported into the configured baseline directory and logged to `sample_compare/baseline`.
+Those images are imported into the configured baseline directory.
 If `sample_compare_baseline_output_dir` is omitted, the project-level directory is used:
 
 ```text
@@ -374,10 +369,10 @@ If `sample_compare_baseline_output_dir` is omitted, the project-level directory 
 The current project-level baseline directory is:
 
 ```text
-/root/shared-nvme/RUM-anima-xpred/compare-baseline/
+./compare-baseline/
 ```
 
-A `.wandb_uploaded` marker prevents repeated baseline uploads.
+A local marker prevents repeated baseline imports.
 
 The older manual `sample_compare` command still supports teacher/student alpha mixing. For that manual command, teacher LoRA defaults to inheriting `[build_cache].teacher_lora`; set it to `""` only when you intentionally want a pure base teacher baseline:
 
@@ -419,60 +414,17 @@ python scripts/dev/anima_rum_xpred_train.py sample_xpred --config configs/anima_
 
 The current sampler writes the final latent tensor. Pixel preview/decode is intentionally separate.
 
-To log visual samples to wandb, enable image decode and wandb in the config:
+To save visual samples, enable image decode in the config:
 
 ```toml
-[wandb]
-wandb_enabled = true
-wandb_mode = "offline"  # or leave empty for online logging
-
 [sample_xpred]
 decode_sample_images = true
-sample_image_dir = "/tmp/anima-xpred-sample/images"
-wandb_log_sample_images = true
+sample_image_dir = "outputs/anima-xpred-sample/images"
 ```
 
-The sampler will save PNG files locally and log them to wandb as `sample/images`.
+The sampler will save PNG files locally.
 
-## 8. Cache Upload Automation
-
-Completed chunk caches can be packaged and uploaded without using the GPU.
-
-The project-local implementation is:
-
-```bash
-python scripts/dev/upload_completed_cache_chunks.py --help
-```
-
-The local private launcher is:
-
-```bash
-./watch_upload_completed_cache_chunks.sh
-```
-
-That launcher is ignored by git because it contains a ModelScope token. Keep secrets there or in environment variables, not in committed docs/configs.
-
-The uploader reads:
-
-```text
-<chunk_root>/chunk-manifest.json
-```
-
-and uploads only chunks whose status is `complete`. With the current launcher it uploads to the repository's `tag` directory using this remote layout:
-
-```text
-tag/<id-min-id-max>/<resolution>/<resolution>.tar
-```
-
-For example:
-
-```text
-tag/69000-71999/1024x1024/1024x1024.tar
-```
-
-With `--delete-cache-after-upload`, each local cache chunk is deleted only after all resolution tar uploads for that chunk succeed.
-
-## 9. Teacher/Student Compare Sampling
+## 8. Teacher/Student Compare Sampling
 
 Use `sample_compare` to inspect conversion progress with fixed prompt and seed:
 

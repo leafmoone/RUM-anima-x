@@ -54,20 +54,20 @@ def test_config_command_can_be_overridden_by_cli_subcommand():
     assert args.output_dir == "/tmp/train"
 
 
-def test_config_merges_wandb_and_gradient_checkpointing_settings():
+def test_config_merges_tracker_and_gradient_checkpointing_settings():
     args = config_to_namespace(
         {
             "command": "train_xpred",
             "common": {"toy_smoke": True},
-            "wandb": {
-                "wandb_enabled": True,
-                "wandb_project": "test-project",
-                "wandb_mode": "offline",
-                "wandb_run_id": "fixed-run",
-                "wandb_resume": "allow",
-                "wandb_tags": ["smoke", "xpred"],
-                "wandb_metrics_file": "/tmp/eval.json",
-                "wandb_metrics_log_every": 5,
+            "tracker": {
+                "tracker_enabled": True,
+                "tracker_project": "test-project",
+                "tracker_mode": "offline",
+                "tracker_run_id": "fixed-run",
+                "tracker_resume": "allow",
+                "tracker_tags": ["smoke", "xpred"],
+                "tracker_metrics_file": "/tmp/eval.json",
+                "tracker_metrics_log_every": 5,
             },
             "train_xpred": {
                 "cache_dir": "/tmp/cache",
@@ -81,7 +81,7 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
                 "sample_eps_floor": 1e-5,
                 "sample_prompt": "preview prompt",
                 "sample_decode_images": True,
-                "sample_wandb_log_images": True,
+                "sample_tracker_log_images": True,
                 "sample_lora": "/models/sample-lora.safetensors",
                 "sample_lora_weight": 0.8,
                 "sample_lora_steps": 10,
@@ -99,7 +99,7 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
                 "sample_compare_output_dir": "/tmp/compare",
                 "sample_compare_baseline_source_dir": "/tmp/alpha-0",
                 "sample_compare_baseline_output_dir": "/tmp/baseline",
-                "sample_compare_baseline_wandb_log_images": True,
+                "sample_compare_baseline_tracker_log_images": True,
                 "sample_compare_lora": "/models/turbo.safetensors",
                 "sample_compare_lora_weight": 0.25,
                 "sample_compare_lora_cfg": 5.5,
@@ -108,7 +108,7 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
                 "sample_compare_teacher_sanity_lora_weight": 0.6,
                 "sample_compare_decode_images": True,
                 "sample_compare_image_prefix": "compare",
-                "sample_compare_wandb_log_images": True,
+                "sample_compare_tracker_log_images": True,
                 "num_train_epochs": 2.0,
                 "lr_scheduler": "cosine",
                 "lr_warmup_steps": 10,
@@ -118,14 +118,14 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
         }
     )
 
-    assert args.wandb_enabled is True
-    assert args.wandb_project == "test-project"
-    assert args.wandb_mode == "offline"
-    assert args.wandb_run_id == "fixed-run"
-    assert args.wandb_resume == "allow"
-    assert args.wandb_tags == ["smoke", "xpred"]
-    assert args.wandb_metrics_file == "/tmp/eval.json"
-    assert args.wandb_metrics_log_every == 5
+    assert args.tracker_enabled is True
+    assert args.tracker_project == "test-project"
+    assert args.tracker_mode == "offline"
+    assert args.tracker_run_id == "fixed-run"
+    assert args.tracker_resume == "allow"
+    assert args.tracker_tags == ["smoke", "xpred"]
+    assert args.tracker_metrics_file == "/tmp/eval.json"
+    assert args.tracker_metrics_log_every == 5
     assert args.gradient_checkpointing is True
     assert args.gradient_checkpointing_cpu_offload is True
     assert args.gradient_checkpointing_unsloth_offload is False
@@ -142,7 +142,7 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
     assert args.sample_eps_floor == 1e-5
     assert args.sample_prompt == "preview prompt"
     assert args.sample_decode_images is True
-    assert args.sample_wandb_log_images is True
+    assert args.sample_tracker_log_images is True
     assert args.sample_lora == "/models/sample-lora.safetensors"
     assert args.sample_lora_weight == 0.8
     assert args.sample_lora_steps == 10
@@ -160,7 +160,7 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
     assert args.sample_compare_output_dir == "/tmp/compare"
     assert args.sample_compare_baseline_source_dir == "/tmp/alpha-0"
     assert args.sample_compare_baseline_output_dir == "/tmp/baseline"
-    assert args.sample_compare_baseline_wandb_log_images is True
+    assert args.sample_compare_baseline_tracker_log_images is True
     assert args.sample_compare_lora == "/models/turbo.safetensors"
     assert args.sample_compare_lora_weight == 0.25
     assert args.sample_compare_lora_cfg == 5.5
@@ -169,7 +169,7 @@ def test_config_merges_wandb_and_gradient_checkpointing_settings():
     assert args.sample_compare_teacher_sanity_lora_weight == 0.6
     assert args.sample_compare_decode_images is True
     assert args.sample_compare_image_prefix == "compare"
-    assert args.sample_compare_wandb_log_images is True
+    assert args.sample_compare_tracker_log_images is True
 
 
 def test_config_loads_v_prediction_type_for_train_and_sample():

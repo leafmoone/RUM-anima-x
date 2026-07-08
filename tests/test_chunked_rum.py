@@ -1,5 +1,7 @@
 import argparse
 
+import pytest
+
 from scripts.dev.anima_rum_xpred_train import (
     DEFAULT_CACHE_BUCKETS,
     CacheBucketBatchCursor,
@@ -21,6 +23,7 @@ from scripts.dev.anima_rum_xpred_train import (
     make_chunk_plan,
     make_prompt_set_chunk_plan,
     planned_chunk_train_steps,
+    planned_prompt_set_cache_sample_count,
     planned_prompt_set_train_steps,
     prediction_to_x,
     prompt_set_mix_weights,
@@ -31,6 +34,7 @@ from scripts.dev.anima_rum_xpred_train import (
     resolve_chunk_student_init,
     should_run_train_compare,
     should_run_train_sample,
+    validate_prepared_cache_dirs,
     x_mse_by_cache_source,
 )
 import torch
@@ -81,6 +85,18 @@ def test_make_prompt_set_chunk_plan_counts_repeat():
         start_index=48,
         num_samples=2,
     )
+
+
+def test_make_prompt_set_chunk_plan_ignores_global_cache_scope_for_total_chunks():
+    prompt_sets = [
+        {"name": "tag", "start_index": 0, "num_samples": 20, "repeat": 1},
+        {"name": "global", "start_index": 0, "num_samples": 100, "repeat": 1, "cache_scope": "all"},
+    ]
+
+    assert make_prompt_set_chunk_plan(prompt_sets=prompt_sets, chunk_size=10, max_chunks=None) == [
+        ChunkPlan(chunk_id=0, start_index=0, num_samples=10),
+        ChunkPlan(chunk_id=1, start_index=10, num_samples=10),
+    ]
 
 
 def test_prompt_set_slice_for_plan_respects_each_set_start_and_total():
@@ -140,13 +156,13 @@ def test_link_repeated_prompt_set_cache_reuses_first_cycle_file(tmp_path):
     assert target.read_bytes() == b"cached latent"
 
 
-def test_prompt_set_mix_weights_use_effective_repeated_totals():
+def test_prompt_set_mix_weights_use_source_sample_totals_not_repeat():
     prompt_sets = [
         {"name": "large", "num_samples": 50, "repeat": 1},
         {"name": "small", "num_samples": 10, "repeat": 5},
     ]
 
-    assert prompt_set_mix_weights(prompt_sets) == [50.0, 50.0]
+    assert prompt_set_mix_weights(prompt_sets) == [50.0, 10.0]
 
 
 def test_completed_chunk_ids_reads_manifest():
@@ -256,6 +272,7 @@ def test_planned_prompt_set_train_steps_uses_active_repeated_samples():
     plans = [
         ChunkPlan(chunk_id=0, start_index=0, num_samples=16),
         ChunkPlan(chunk_id=1, start_index=16, num_samples=16),
+        ChunkPlan(chunk_id=2, start_index=32, num_samples=16),
     ]
     prompt_sets = [
         {"name": "large", "num_samples": 32, "repeat": 1},
@@ -263,6 +280,41 @@ def test_planned_prompt_set_train_steps_uses_active_repeated_samples():
     ]
 
     assert planned_prompt_set_train_steps(train_args, chunk_args, plans, prompt_sets) == 6
+
+
+def test_planned_prompt_set_train_steps_counts_global_cache_pool_each_chunk():
+    train_args = argparse.Namespace(
+        max_train_steps=None,
+        train_batch_size=4,
+        gradient_accumulation_steps=2,
+        num_train_epochs=1.0,
+    )
+    chunk_args = argparse.Namespace(train_steps_per_chunk=None)
+    plans = [
+        ChunkPlan(chunk_id=0, start_index=0, num_samples=16),
+        ChunkPlan(chunk_id=1, start_index=16, num_samples=16),
+        ChunkPlan(chunk_id=2, start_index=32, num_samples=16),
+    ]
+    prompt_sets = [
+        {"name": "tag", "num_samples": 32, "repeat": 1},
+        {"name": "small", "num_samples": 8, "repeat": 1, "cache_scope": "all"},
+    ]
+
+    assert planned_prompt_set_train_steps(train_args, chunk_args, plans, prompt_sets) == 7
+
+
+def test_planned_prompt_set_cache_sample_count_spreads_global_pool_across_chunks():
+    plans = [
+        ChunkPlan(chunk_id=0, start_index=0, num_samples=10),
+        ChunkPlan(chunk_id=1, start_index=10, num_samples=10),
+    ]
+    prompt_sets = [
+        {"name": "tag", "num_samples": 20, "repeat": 1},
+        {"name": "global", "num_samples": 6, "repeat": 1, "cache_scope": "all"},
+    ]
+
+    assert planned_prompt_set_cache_sample_count(plans[0], plans, prompt_sets) == 13
+    assert planned_prompt_set_cache_sample_count(plans[1], plans, prompt_sets) == 13
 
 
 def test_prompt_set_chunk_offset_maps_sources_to_different_chunk_numbers(tmp_path):
@@ -276,6 +328,18 @@ def test_prompt_set_chunk_offset_maps_sources_to_different_chunk_numbers(tmp_pat
     assert chunk_cache_dirs_for_prompt_sets(prompt_sets, training_chunk_id=1) == [
         str(tmp_path / "tag" / "chunk-0015"),
         str(tmp_path / "nl" / "chunk-0001"),
+    ]
+
+
+def test_chunk_cache_dirs_can_use_entire_cache_scope(tmp_path):
+    prompt_sets = [
+        {"name": "tag", "cache_dir": str(tmp_path / "tag")},
+        {"name": "nl", "cache_dir": str(tmp_path / "nl"), "cache_scope": "all"},
+    ]
+
+    assert chunk_cache_dirs_for_prompt_sets(prompt_sets, training_chunk_id=3) == [
+        str(tmp_path / "tag" / "chunk-0003"),
+        str(tmp_path / "nl"),
     ]
 
 
@@ -332,6 +396,40 @@ def test_collect_cache_buckets_separates_resolution_dirs(tmp_path):
     assert buckets[1].files == [bucket_file]
 
 
+def test_collect_cache_buckets_groups_nested_chunk_resolution_dirs(tmp_path):
+    first = tmp_path / "chunk-0000" / "1024x1024"
+    second = tmp_path / "chunk-0001" / "1024x1024"
+    other = tmp_path / "chunk-0001" / "832x1216"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    other.mkdir(parents=True)
+    first_file = first / "sample-000000.safetensors"
+    second_file = second / "sample-005000.safetensors"
+    other_file = other / "sample-005001.safetensors"
+    first_file.write_text("first", encoding="utf-8")
+    second_file.write_text("second", encoding="utf-8")
+    other_file.write_text("other", encoding="utf-8")
+
+    buckets = collect_cache_buckets(tmp_path)
+
+    assert [bucket.name for bucket in buckets] == ["1024x1024", "832x1216"]
+    assert buckets[0].files == [first_file, second_file]
+    assert buckets[1].files == [other_file]
+
+
+def test_validate_prepared_cache_dirs_accepts_ready_cache(tmp_path):
+    cache_dir = tmp_path / "tag" / "chunk-0048" / "1024x1024"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "sample-213000.safetensors").write_text("cache", encoding="utf-8")
+
+    validate_prepared_cache_dirs([str(tmp_path / "tag" / "chunk-0048")])
+
+
+def test_validate_prepared_cache_dirs_rejects_missing_cache(tmp_path):
+    with pytest.raises(FileNotFoundError, match="prepared cache dir is missing"):
+        validate_prepared_cache_dirs([str(tmp_path / "tag" / "chunk-0048")])
+
+
 def test_cache_bucket_cursor_returns_one_bucket_per_batch(tmp_path):
     a = tmp_path / "1024x1024"
     b = tmp_path / "832x1216"
@@ -373,6 +471,31 @@ def test_multi_cache_bucket_cursor_mixes_sources_within_one_resolution(tmp_path)
     assert sum("/a/" in str(path) for path in batch) == 4
     assert sum("/b/" in str(path) for path in batch) == 4
     assert {path.parent.name for path in batch} == {"1024x1024"}
+
+
+def test_multi_cache_bucket_cursor_random_weights_let_small_sources_participate(tmp_path):
+    sources = ["tag", "multicap", "short", "names", "no_names", "individual"]
+    weights = [213000, 30000, 50000, 10000, 10000, 10000]
+    for source in sources:
+        bucket = tmp_path / source / "1024x1024"
+        bucket.mkdir(parents=True)
+        for index in range(128):
+            (bucket / f"sample-{index:06d}.safetensors").write_text(source, encoding="utf-8")
+
+    cursor = MultiCacheBucketBatchCursor(
+        [collect_cache_buckets(tmp_path / source) for source in sources],
+        batch_size=8,
+        weights=weights,
+        shuffle=True,
+        seed=11,
+        drop_last=False,
+    )
+    seen = {source: 0 for source in sources}
+    for _ in range(500):
+        for path in cursor.next():
+            seen[path.parents[1].name] += 1
+
+    assert all(count > 0 for count in seen.values())
 
 
 def test_cache_source_names_and_indices_support_chunk_dirs(tmp_path):

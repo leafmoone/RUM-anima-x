@@ -49,29 +49,50 @@ def make_prompt_set_chunk_plan(
 ) -> list[ChunkPlan]:
     if chunk_size < 1:
         raise ValueError("chunk_size must be >= 1")
-    totals = []
+    chunk_scope_totals = []
+    all_totals = []
     for index, prompt_set in enumerate(prompt_sets):
         num_samples = prompt_set.get("num_samples")
         if num_samples is None:
             raise ValueError(f"prompt_sets[{index}] requires num_samples when chunked_rum.total_samples is omitted")
-        totals.append(int(num_samples) * int(prompt_set.get("repeat", 1)))
+        effective_total = int(num_samples) * int(prompt_set.get("repeat", 1))
+        all_totals.append(effective_total)
+        if prompt_set_cache_scope(prompt_set) == "chunk":
+            chunk_scope_totals.append(effective_total)
+    totals = chunk_scope_totals or all_totals
     total_samples = max(totals) if totals else 0
     return make_chunk_plan(start_index=0, total_samples=total_samples, chunk_size=chunk_size, max_chunks=max_chunks)
 
 
-def prompt_set_effective_total(prompt_set: dict) -> int:
+def _prompt_set_name(prompt_set: dict) -> str:
+    return prompt_set.get("name", "<unnamed>")
+
+
+def _required_prompt_set_num_samples(prompt_set: dict) -> int:
     set_total = prompt_set.get("num_samples")
     if set_total is None:
-        raise ValueError(f"prompt set {prompt_set.get('name', '<unnamed>')} requires num_samples")
-    return int(set_total) * int(prompt_set.get("repeat", 1))
+        raise ValueError(f"prompt set {_prompt_set_name(prompt_set)} requires num_samples")
+    return int(set_total)
+
+
+def prompt_set_effective_total(prompt_set: dict) -> int:
+    return _required_prompt_set_num_samples(prompt_set) * int(prompt_set.get("repeat", 1))
+
+
+def prompt_set_weight_total(prompt_set: dict) -> int:
+    return _required_prompt_set_num_samples(prompt_set)
+
+
+def prompt_set_cache_scope(prompt_set: dict) -> str:
+    scope = str(prompt_set.get("cache_scope", "chunk"))
+    if scope not in {"chunk", "all"}:
+        raise ValueError(f"prompt set {_prompt_set_name(prompt_set)} has unsupported cache_scope: {scope!r}")
+    return scope
 
 
 def prompt_set_slices_for_plan(prompt_set: dict, plan: ChunkPlan) -> list[dict]:
     set_start = int(prompt_set.get("start_index", 0))
-    set_total = prompt_set.get("num_samples")
-    if set_total is None:
-        raise ValueError(f"prompt set {prompt_set.get('name', '<unnamed>')} requires num_samples")
-    set_total = int(set_total)
+    set_total = _required_prompt_set_num_samples(prompt_set)
     effective_total = prompt_set_effective_total(prompt_set)
     effective_offset = plan.start_index
     remaining = effective_total - effective_offset
@@ -191,6 +212,7 @@ def normalize_prompt_sets(args: argparse.Namespace) -> list[dict] | None:
                 "num_samples": prompt_set.get("num_samples", getattr(args, "num_samples", None)),
                 "cache_chunk_offset": int(prompt_set.get("cache_chunk_offset", 0)),
                 "repeat": int(prompt_set.get("repeat", 1)),
+                "cache_scope": prompt_set_cache_scope(prompt_set),
             }
         )
         if normalized[-1]["repeat"] < 1:
@@ -199,11 +221,18 @@ def normalize_prompt_sets(args: argparse.Namespace) -> list[dict] | None:
 
 
 def prompt_set_mix_weights(prompt_sets: list[dict]) -> list[float]:
-    return [float(prompt_set_effective_total(prompt_set)) for prompt_set in prompt_sets]
+    return [float(prompt_set_weight_total(prompt_set)) for prompt_set in prompt_sets]
 
 
 def prompt_set_chunk_name(prompt_set: dict, training_chunk_id: int) -> str:
     return f"chunk-{training_chunk_id + int(prompt_set.get('cache_chunk_offset', 0)):04d}"
+
+
+def prompt_set_cache_dir_for_plan(prompt_set: dict, training_chunk_id: int) -> str:
+    base = Path(prompt_set["cache_dir"])
+    if prompt_set_cache_scope(prompt_set) == "all":
+        return str(base)
+    return str(base / prompt_set_chunk_name(prompt_set, training_chunk_id))
 
 
 def link_or_symlink_cache_file(source: Path, target: Path) -> None:
@@ -273,4 +302,4 @@ def link_repeated_prompt_set_cache(
 
 
 def chunk_cache_dirs_for_prompt_sets(prompt_sets: list[dict], training_chunk_id: int) -> list[str]:
-    return [str(Path(prompt_set["cache_dir"]) / prompt_set_chunk_name(prompt_set, training_chunk_id)) for prompt_set in prompt_sets]
+    return [prompt_set_cache_dir_for_plan(prompt_set, training_chunk_id) for prompt_set in prompt_sets]

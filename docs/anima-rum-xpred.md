@@ -173,7 +173,7 @@ sample_eps_floor = 1e-4
 sample_decode_images = true
 ```
 
-The hook runs after `optimizer.step()` when the active training step reaches the interval. In `chunked_rum`, this is the total optimizer step across completed chunks, not the local step inside the current chunk. It uses the same `prediction_type` as training. Latent previews are saved under `output_dir/train-samples/latents`; decoded images are saved under `output_dir/train-samples/images` and logged to wandb as `sample/images` when wandb is enabled.
+The hook runs after `optimizer.step()` when the active training step reaches the interval. In `chunked_rum`, this is the total optimizer step across completed chunks, not the local step inside the current chunk. It uses the same `prediction_type` as training. Latent previews are saved under `output_dir/train-samples/latents`; decoded images are saved under `output_dir/train-samples/images`.
 
 ## CFG
 
@@ -253,7 +253,7 @@ The cache builder can use an explicit teacher LoRA:
 ```toml
 [build_cache]
 teacher_steps = 10
-teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
+teacher_lora = "models/anima/anima-turbo-lora-v0.2.safetensors"
 teacher_lora_weight = 1.0
 ```
 

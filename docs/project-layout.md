@@ -9,8 +9,7 @@ This repository is a standalone Anima latent x-pred RUM conversion experiment.
 - `src/rum_xpred/vendor_paths.py` - local vendor path resolver.
 - `src/rum_xpred/config.py` - TOML config loading and validation.
 - `scripts/dev/anima_rum_xpred_train.py` - single CLI for `build_cache`, `train_xpred`, `sample_xpred`, and `chunked_rum`.
-- `scripts/dev/import_chunked_cache.py` - import externally packed cache archives into the chunk layout.
-- `scripts/dev/upload_completed_cache_chunks.py` - package completed chunk caches and upload them to ModelScope.
+- `scripts/dev/import_chunked_cache.py` - import packed cache archives into the chunk layout.
 - `configs/anima_xpred.example.toml` - commented config covering all stages and runtime options.
 - `tests/test_anima_rum_xpred.py` - lightweight formula/cache/sampler tests.
 - `agent.md` - operational handoff for the next agent.
@@ -19,13 +18,13 @@ This repository is a standalone Anima latent x-pred RUM conversion experiment.
 
 - `vendor/sd-scripts/` - local copy of the Anima/kohya implementation needed for model loading, text encoding, and DiT forward/sampling support.
 
-This project does not depend on `/root/shared-nvme/lora-scripts-next` at runtime.
+Runtime code resolves vendored files from this repository.
 
 ## Data
 
 - `data/prompts/sample_prompts.txt` - tiny prompt file for toy smoke checks.
 
-Large prompt lists and generated caches are intentionally not included. Put explicit paths in the config when running real experiments.
+Large prompt lists and generated caches are intentionally not included. Put project-relative paths in ignored local configs when running real experiments.
 
 ## Runtime Artifacts
 
@@ -35,10 +34,9 @@ The following are generated local state and should not be treated as source:
 - `anima-xpred-train/`
 - `cache/`, `cache_data/`, `*-cache/`, `*cache*/`
 - `compare-baseline/`
-- `wandb/`
 - local paper PDFs such as `2605.27102v2.pdf`
 
-`watch_upload_completed_cache_chunks.sh` is a private local launcher with a ModelScope token and is intentionally ignored by git. The source implementation is `scripts/dev/upload_completed_cache_chunks.py`.
+Private launcher scripts are intentionally ignored by git.
 
 ## Removed Scope
 

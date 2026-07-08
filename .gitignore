@@ -22,11 +22,12 @@ __pycache__/
 .env
 .env.*
 !.env.example
-watch_upload_completed_cache_chunks.sh
+configs/*.local.toml
+configs/anima_xpred.tag_*.toml
 
 # Logs and experiment trackers
 logs/
-wandb/
+tracker/
 compare-baseline/
 
 # Generated outputs
@@ -53,6 +54,7 @@ cache_data/
 *-cache/
 *cache*/
 anima-xpred-chunks/
+anima-*-xpred-chunks/
 anima-xpred-turbo10-chunks/
 anima-jlt-xpred-turbo10-chunks/
 chunk-manifest.json

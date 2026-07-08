@@ -13,13 +13,13 @@ for path in (PROJECT_ROOT, SRC_ROOT):
 from rum_xpred.cache_import import import_cache_archives
 
 
-# Edit this list when new transferred cache folders arrive.
+# Edit this list when new cache folders are ready.
 SOURCE_DIRS = [
-    # Path("/root/shared-nvme/cache/175000-180000"),
+    # PROJECT_ROOT / "cache_data" / "175000-180000",
 ]
 
 # Keep these values aligned with [chunked_rum] in configs/anima_xpred.example.toml.
-CHUNK_ROOT = Path("/root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks")
+CHUNK_ROOT = PROJECT_ROOT / "anima-jlt-xpred-turbo10-chunks"
 START_INDEX = 69000
 CHUNK_SIZE = 3000
 

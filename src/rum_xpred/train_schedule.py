@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from rum_xpred.chunking import ChunkPlan, prompt_set_effective_total
+from rum_xpred.chunking import ChunkPlan, prompt_set_cache_scope, prompt_set_effective_total, prompt_set_weight_total
 
 
 def lr_scale_for_step(args: argparse.Namespace, step: int) -> float:
@@ -58,11 +58,20 @@ def planned_prompt_set_train_steps(train_args: argparse.Namespace, chunk_args: a
         return train_args.max_train_steps * len(plans)
     total = 0
     for plan in plans:
-        cache_sample_count = 0
-        for prompt_set in prompt_sets:
-            remaining = prompt_set_effective_total(prompt_set) - plan.start_index
-            if remaining > 0:
-                cache_sample_count += min(plan.num_samples, remaining)
+        cache_sample_count = planned_prompt_set_cache_sample_count(plan, plans, prompt_sets)
         if cache_sample_count > 0:
             total += resolve_max_train_steps(train_args, cache_sample_count)
     return total
+
+
+def planned_prompt_set_cache_sample_count(plan: ChunkPlan, plans: list[ChunkPlan], prompt_sets: list[dict]) -> int:
+    chunk_scope_total = sum(plan.num_samples for plan in plans)
+    cache_sample_count = 0
+    for prompt_set in prompt_sets:
+        if prompt_set_cache_scope(prompt_set) == "all":
+            cache_sample_count += math.ceil(prompt_set_weight_total(prompt_set) * plan.num_samples / chunk_scope_total)
+            continue
+        remaining = prompt_set_effective_total(prompt_set) - plan.start_index
+        if remaining > 0:
+            cache_sample_count += min(plan.num_samples, remaining)
+    return cache_sample_count

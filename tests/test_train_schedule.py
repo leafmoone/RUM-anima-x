@@ -9,7 +9,7 @@ import scripts.dev.anima_rum_xpred_train as train_mod
 from scripts.dev.anima_rum_xpred_train import (
     build_cache,
     final_optimizer_state_for_train_args,
-    log_sample_images_to_wandb,
+    log_sample_images_to_tracker,
     prepare_memory_for_training_generation,
     reflow_loss,
     resolve_max_train_steps,
@@ -114,9 +114,9 @@ def test_train_xpred_saves_and_loads_optimizer_state(tmp_path):
         gradient_checkpointing_unsloth_offload=False,
         sample_every_steps=0,
         dry_run=False,
-        wandb_enabled=False,
-        wandb_metrics_log_every=0,
-        wandb_metrics_file=None,
+        tracker_enabled=False,
+        tracker_metrics_log_every=0,
+        tracker_metrics_file=None,
         global_step_offset=0,
     )
     train_xpred(first)
@@ -290,9 +290,9 @@ def test_train_xpred_accepts_multiple_cache_dirs(tmp_path):
         gradient_checkpointing_unsloth_offload=False,
         sample_every_steps=0,
         dry_run=False,
-        wandb_enabled=False,
-        wandb_metrics_log_every=0,
-        wandb_metrics_file=None,
+        tracker_enabled=False,
+        tracker_metrics_log_every=0,
+        tracker_metrics_file=None,
         global_step_offset=0,
     )
 
@@ -303,7 +303,7 @@ def test_train_xpred_accepts_multiple_cache_dirs(tmp_path):
     assert final_optimizer_state_for_train_args(args).exists()
 
 
-def test_training_sample_uses_total_step_and_logs_images_to_wandb(tmp_path, monkeypatch):
+def test_training_sample_uses_total_step_and_logs_images_to_tracker(tmp_path, monkeypatch):
     class ConstantXStudent(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -327,10 +327,10 @@ def test_training_sample_uses_total_step_and_logs_images_to_wandb(tmp_path, monk
 
     calls = []
 
-    def fake_log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=None, *, key="sample/images"):
+    def fake_log_sample_images_to_tracker(tracker_run, image_paths, prompt, step=None, *, key="sample/images"):
         calls.append(
             {
-                "wandb_run": wandb_run,
+                "tracker_run": tracker_run,
                 "image_paths": list(image_paths),
                 "prompt": prompt,
                 "step": step,
@@ -338,7 +338,7 @@ def test_training_sample_uses_total_step_and_logs_images_to_wandb(tmp_path, monk
             }
         )
 
-    monkeypatch.setattr(train_mod, "log_sample_images_to_wandb", fake_log_sample_images_to_wandb)
+    monkeypatch.setattr(train_mod, "log_sample_images_to_tracker", fake_log_sample_images_to_tracker)
 
     args = argparse.Namespace(
         toy_smoke=False,
@@ -358,7 +358,7 @@ def test_training_sample_uses_total_step_and_logs_images_to_wandb(tmp_path, monk
         sample_output_dir=str(tmp_path / "samples"),
         output_dir=str(tmp_path / "train"),
         sample_decode_images=True,
-        sample_wandb_log_images=True,
+        sample_tracker_log_images=True,
         sample_image_prefix="preview",
         global_step_offset=1999,
     )
@@ -370,14 +370,14 @@ def test_training_sample_uses_total_step_and_logs_images_to_wandb(tmp_path, monk
         device=torch.device("cpu"),
         dtype=torch.float32,
         global_step=1,
-        wandb_run="run",
+        tracker_run="run",
     )
 
     assert (tmp_path / "samples" / "latents" / "xpred-step-002000.pt").exists()
     assert image_paths == [tmp_path / "samples" / "images" / "step-002000" / "preview-0000.png"]
     assert calls == [
         {
-            "wandb_run": "run",
+            "tracker_run": "run",
             "image_paths": image_paths,
             "prompt": "preview prompt",
             "step": 2000,
@@ -427,7 +427,7 @@ def test_training_sample_lora_can_use_separate_step_count(tmp_path):
         sample_output_dir=str(tmp_path / "samples"),
         output_dir=str(tmp_path / "train"),
         sample_decode_images=False,
-        sample_wandb_log_images=True,
+        sample_tracker_log_images=True,
         sample_image_prefix="preview",
         sample_lora="/models/turbo.safetensors",
         sample_lora_weight=1.0,
@@ -447,7 +447,7 @@ def test_training_sample_lora_can_use_separate_step_count(tmp_path):
         device=torch.device("cpu"),
         dtype=torch.float32,
         global_step=1,
-        wandb_run=None,
+        tracker_run=None,
     )
 
     main_latent = torch.load(tmp_path / "samples" / "latents" / "xpred-step-002000.pt", map_location="cpu")
@@ -457,7 +457,7 @@ def test_training_sample_lora_can_use_separate_step_count(tmp_path):
     assert lora_latent["sigmas"].numel() == 11
 
 
-def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_path, monkeypatch):
+def test_training_sample_compare_uses_total_step_and_logs_images_to_tracker(tmp_path, monkeypatch):
     class ConstantXStudent(torch.nn.Module):
         def forward(self, z, sigma):
             return torch.zeros_like(z)
@@ -504,10 +504,10 @@ def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_pa
 
     calls = []
 
-    def fake_log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=None, *, key="sample/images"):
+    def fake_log_sample_images_to_tracker(tracker_run, image_paths, prompt, step=None, *, key="sample/images"):
         calls.append(
             {
-                "wandb_run": wandb_run,
+                "tracker_run": tracker_run,
                 "image_paths": list(image_paths),
                 "prompt": prompt,
                 "step": step,
@@ -515,7 +515,7 @@ def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_pa
             }
         )
 
-    monkeypatch.setattr(train_mod, "log_sample_images_to_wandb", fake_log_sample_images_to_wandb)
+    monkeypatch.setattr(train_mod, "log_sample_images_to_tracker", fake_log_sample_images_to_tracker)
 
     args = argparse.Namespace(
         toy_smoke=False,
@@ -545,7 +545,7 @@ def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_pa
         sample_compare_output_dir=str(tmp_path / "compare"),
         sample_compare_decode_images=True,
         sample_compare_image_prefix="compare",
-        sample_compare_wandb_log_images=True,
+        sample_compare_tracker_log_images=True,
             sample_compare_lora="/teacher/turbo.safetensors",
             sample_compare_lora_weight=0.75,
             sample_compare_lora_cfg=2.5,
@@ -559,7 +559,7 @@ def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_pa
         device=torch.device("cpu"),
         dtype=torch.float32,
         global_step=1,
-        wandb_run="run",
+        tracker_run="run",
     )
 
     assert (tmp_path / "compare" / "step-002000" / "compare-latents.pt").exists()
@@ -571,7 +571,7 @@ def test_training_sample_compare_uses_total_step_and_logs_images_to_wandb(tmp_pa
     ]
     assert calls == [
         {
-            "wandb_run": "run",
+            "tracker_run": "run",
             "image_paths": image_paths,
             "prompt": "compare prompt",
             "step": 2000,
@@ -598,10 +598,10 @@ def test_maybe_import_compare_baseline_copies_and_logs_images(tmp_path, monkeypa
     (source / ".ipynb_checkpoints" / "ignored.png").write_bytes(b"ignored")
     calls = []
 
-    def fake_log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=None, *, key="sample/images"):
+    def fake_log_sample_images_to_tracker(tracker_run, image_paths, prompt, step=None, *, key="sample/images"):
         calls.append(
             {
-                "wandb_run": wandb_run,
+                "tracker_run": tracker_run,
                 "image_paths": list(image_paths),
                 "prompt": prompt,
                 "step": step,
@@ -609,25 +609,25 @@ def test_maybe_import_compare_baseline_copies_and_logs_images(tmp_path, monkeypa
             }
         )
 
-    monkeypatch.setattr(train_mod, "log_sample_images_to_wandb", fake_log_sample_images_to_wandb)
+    monkeypatch.setattr(train_mod, "log_sample_images_to_tracker", fake_log_sample_images_to_tracker)
     args = argparse.Namespace(
         output_dir=str(tmp_path / "train"),
         sample_prompt="prompt",
         sample_compare_prompt="",
         sample_compare_baseline_source_dir=str(source),
         sample_compare_baseline_output_dir=str(tmp_path / "train" / "compare-baseline"),
-        sample_compare_baseline_wandb_log_images=True,
+        sample_compare_baseline_tracker_log_images=True,
     )
 
-    copied = train_mod.maybe_import_compare_baseline(args, wandb_run="run")
-    copied_again = train_mod.maybe_import_compare_baseline(args, wandb_run="run")
+    copied = train_mod.maybe_import_compare_baseline(args, tracker_run="run")
+    copied_again = train_mod.maybe_import_compare_baseline(args, tracker_run="run")
 
     assert copied == [tmp_path / "train" / "compare-baseline" / "teacher-baseline-0000.png"]
     assert copied[0].exists()
     assert copied_again == []
     assert calls == [
         {
-            "wandb_run": "run",
+            "tracker_run": "run",
             "image_paths": copied,
             "prompt": "prompt",
             "step": None,
@@ -636,7 +636,7 @@ def test_maybe_import_compare_baseline_copies_and_logs_images(tmp_path, monkeypa
     ]
 
 
-def test_log_sample_images_to_wandb_omits_stale_explicit_step(tmp_path, monkeypatch):
+def test_log_sample_images_to_tracker_omits_stale_explicit_step(tmp_path, monkeypatch):
     image_path = tmp_path / "sample.png"
     image_path.write_bytes(b"fake image")
 
@@ -649,11 +649,11 @@ def test_log_sample_images_to_wandb_omits_stale_explicit_step(tmp_path, monkeypa
         def log(self, payload, step=None):
             self.calls.append((payload, step))
 
-    fake_wandb = types.SimpleNamespace(Image=lambda path, caption=None: {"path": path, "caption": caption})
-    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    fake_tracker = types.SimpleNamespace(Image=lambda path, caption=None: {"path": path, "caption": caption})
+    monkeypatch.setitem(sys.modules, "tracker", fake_tracker)
     run = FakeRun()
 
-    log_sample_images_to_wandb(run, [image_path], "prompt", step=2170, key="sample_compare/images")
+    log_sample_images_to_tracker(run, [image_path], "prompt", step=2170, key="sample_compare/images")
 
     assert run.calls[0][1] is None
     assert run.calls[0][0]["sample_compare/step"] == 2170

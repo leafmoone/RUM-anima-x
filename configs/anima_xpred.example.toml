@@ -23,7 +23,7 @@ command = "chunked_rum"
 #   python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_xpred.example.toml
 
 # rolling cache、分段训练输出和 manifest 的根目录。
-chunk_root = "/root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks"
+chunk_root = "./anima-jlt-xpred-turbo10-chunks"
 
 # 不使用 build_cache.prompt_sets 时，才需要显式设置 start_index/total_samples。
 # 使用 prompt_sets 时，chunked_rum 会按各 set 的 start_index/num_samples 自动推导 chunk 计划。
@@ -46,6 +46,9 @@ chunk_size = 3000
 # true 时每个 chunk 训练完成后删除对应 cache，省磁盘。
 # 注意：删除后无法重新训练该 chunk，除非重新 build cache。
 delete_cache_after_train = false
+
+# true 时 chunked_rum 不再运行 build_cache，只验证预先准备的 cache 目录已存在。
+prepared_cache_only = true
 
 # true 时读取 chunk-manifest.json，跳过已 complete 的 chunk。
 resume = true
@@ -70,16 +73,16 @@ toy_smoke = false
 adapter = "rum_xpred.adapters.anima_sd_scripts:create_adapter"
 
 # 真实 Anima DiT teacher checkpoint。
-dit = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+dit = "models/anima/diffusion_models/anima-base-v1.0.safetensors"
 
 # student 初始化 checkpoint；留空时 train_xpred 默认从 dit 初始化。
-student_init = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-turbo10-chunks/train/chunk-0022/xpred-adapter-checkpoint.safetensors"
+student_init = "./anima-xpred-turbo10-chunks/train/chunk-0022/xpred-adapter-checkpoint.safetensors"
 
 # Qwen3 text encoder。当前真实 adapter 必须提供。
-text_encoder = "/root/shared-nvme/anima/split_files/text_encoders/qwen_3_06b_base.safetensors"
+text_encoder = "models/anima/text_encoders/qwen_3_06b_base.safetensors"
 
 # Anima/Qwen VAE。当前 RUM 链路只缓存 latent；VAE 主要为后续 preview decode 预留。
-vae = "/root/shared-nvme/anima/split_files/vae/qwen_image_vae.safetensors"
+vae = "models/anima/vae/qwen_image_vae.safetensors"
 
 # VAE decode 分块设置。显存紧张时可设为 256/512；删除表示不分块。
 # vae_spatial_chunk_size = 512
@@ -98,41 +101,41 @@ fp8_scaled = false
 # true 时 text encoder 保留在 CPU，显存压力小但更慢。
 text_encoder_cpu = false
 
-[wandb]
+[tracker]
 # 默认关闭。打开后会记录 train/loss、train/grad_norm、train/lr 和有效 batch size。
-wandb_enabled = true
+tracker_enabled = false
 
-# wandb 基础信息。wandb_mode 可设为 "offline" 做本地记录。
-wandb_project = "rum-anima-xpred-jlt"
-wandb_entity = ""
-wandb_run_name = "anima-xpred-rum"
+# 可选实验追踪设置，默认关闭。
+tracker_project = "rum-anima-xpred-jlt"
+tracker_entity = ""
+tracker_run_name = "anima-xpred-rum"
 
-# 固定 run id 后，chunked_rum 每个 chunk 重新 wandb.init 也会接到同一个 W&B run。
+# 固定 run id 后，分 chunk 运行可继续写入同一个实验记录。
 # 第一次使用某个 id 时会创建 run；之后 resume="allow" 会继续写入同一个 run。
-wandb_run_id = "anima-xpred-rum-jlt-20260703"
-wandb_resume = "allow"
+tracker_run_id = "anima-xpred-rum-jlt-20260703"
+tracker_resume = "allow"
 
-wandb_mode = ""
-wandb_tags = ["anima", "rum", "xpred"]
-wandb_notes = "Anima latent x-pred RUM reflow experiment."
+tracker_mode = ""
+tracker_tags = ["anima", "rum", "xpred"]
+tracker_notes = "Anima latent x-pred RUM reflow experiment."
 
-# true 时把当前 config/参数写入 wandb config。
-wandb_log_config = true
+# true 时把当前 config/参数写入实验记录。
+tracker_log_config = true
 
-# 可选：外部评估脚本写出的 JSON。训练循环会读取其中的 fid/is 并记录到 wandb。
+# 可选：本地评估脚本写出的 JSON。训练循环会读取其中的 fid/is。
 # 示例 JSON: {"fid": 12.3, "is": 5.6}
 # 当前项目训练本身只处理 latent，不会凭空计算 FID/IS。
-# wandb_metrics_file = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/eval-metrics.json"
+# tracker_metrics_file = "./anima-xpred-train/eval-metrics.json"
 
-# 每隔多少 optimizer step 读取一次 wandb_metrics_file；0 表示不读取外部指标。
-wandb_metrics_log_every = 0
+# 每隔多少 optimizer step 读取一次 metrics file；0 表示不读取指标。
+tracker_metrics_log_every = 0
 
 [build_cache]
 # prompt 文件，一行一个 prompt。cache 阶段只保存 latent 和 text conditioning。
-prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts.txt"
+prompts = "data/prompts/qat_prompts.txt"
 
 # teacher endpoint cache 输出目录。turbo LoRA cache 不要和 base 30-step cache 混用。
-cache_dir = "/root/shared-nvme/cache_data/150000"
+cache_dir = "cache_data/150000"
 
 
 # 只读取前 N 条 prompt；null 表示读取全部。
@@ -164,7 +167,7 @@ teacher_steps = 10
 teacher_cfg = 1.0
 
 # 可选 teacher LoRA。这里使用 Anima Turbo LoRA 作为少步数 teacher 实验。
-teacher_lora = "/root/shared-nvme/anima/anima-turbo-lora-v0.2.safetensors"
+teacher_lora = "models/anima/anima-turbo-lora-v0.2.safetensors"
 
 # teacher LoRA 权重。
 teacher_lora_weight = 1.0
@@ -175,67 +178,67 @@ teacher_lora_weight = 1.0
 #
 # [[build_cache.prompt_sets]]
 # name = "multicap_mix_30k"
-# prompts = "/root/shared-nvme/RUM/data/prompts/qat_prompts_anime_multicap_mix_30k.txt"
-# cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/multicap_mix_30k"
+# prompts = "data/prompts/qat_prompts_anime_multicap_mix_30k.txt"
+# cache_dir = "./cache_mix/multicap_mix_30k"
 # start_index = 0
 # num_samples = 30000
 # repeat 只增加等效训练长度；第一轮之后会复用/链接已有 cache，不会重新跑教师生成。
 # repeat = 1
 # cache_chunk_offset = 0
 
-[[build_cache.prompt_sets]]
-name = "short_nl"
-prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
-cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl"
-start_index = 0
-num_samples = 50000
-repeat = 1
-cache_chunk_offset = 0
+# [[build_cache.prompt_sets]]
+# name = "short_nl"
+# prompts = "./data/prompts/qat_prompts_chars_short_vibes_few_words_50k.txt"
+# cache_dir = "./cache_mix/short_nl"
+# start_index = 0
+# num_samples = 50000
+# repeat = 1
+# cache_chunk_offset = 0
 
 
-[[build_cache.prompt_sets]]
-name = "long_names_10k"
-prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_long_names_10k.txt"
-cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/long_names_10k"
-start_index = 0
-num_samples = 10000
-repeat = 5
-cache_chunk_offset = 0
+# [[build_cache.prompt_sets]]
+# name = "long_names_10k"
+# prompts = "./data/prompts/qat_prompts_long_names_10k.txt"
+# cache_dir = "./cache_mix/long_names_10k"
+# start_index = 0
+# num_samples = 10000
+# repeat = 5
+# cache_chunk_offset = 0
 
-[[build_cache.prompt_sets]]
-name = "long_no_names_10k"
-prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_long_no_names_10k.txt"
-cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/long_no_names_10k"
-start_index = 0
-num_samples = 10000
-repeat = 5
-cache_chunk_offset = 0
+# [[build_cache.prompt_sets]]
+# name = "long_no_names_10k"
+# prompts = "./data/prompts/qat_prompts_long_no_names_10k.txt"
+# cache_dir = "./cache_mix/long_no_names_10k"
+# start_index = 0
+# num_samples = 10000
+# repeat = 5
+# cache_chunk_offset = 0
 
 [[build_cache.prompt_sets]]
 name = "min_individual_json_flat_10k"
-prompts = "/root/shared-nvme/RUM-anima-xpred/data/prompts/qat_prompts_min_individual_json_flat_10k.txt"
-cache_dir = "/root/shared-nvme/RUM-anima-xpred/cache_mix/min_individual_json_flat_10k"
-start_index = 0
-num_samples = 10000
+prompts = "./data/prompts/qat_prompts_min_individual_json_flat_10k.txt"
+cache_dir = "./cache_mix/min_individual_json_flat_10k"
+start_index = 4576
+num_samples = 5424
 repeat = 5
 cache_chunk_offset = 0
 
 [train_xpred]
 # build_cache 输出的 safetensors cache 目录。
-cache_dir = "/root/shared-nvme/cache_data/anima-xpred-turbo10-cache"
+cache_dir = "cache_data/anima-xpred-turbo10-cache"
 
 # 可选：多个 cache 目录混合训练。启用 cache_dirs 后会忽略 cache_dir。
 # chunked_rum + build_cache.prompt_sets 会自动填入每个 set 的当前 chunk 目录。
 # 单独 train_xpred 时可手动写入目录。
 # cache_dirs = [
-#   "/root/shared-nvme/RUM-anima-xpred/cache_mix/tag/chunk-0000",
-#   "/root/shared-nvme/RUM-anima-xpred/cache_mix/short_nl/chunk-0000",
+#   "./cache_mix/tag/chunk-0000",
+#   "./cache_mix/short_nl/chunk-0000",
 # ]
 # cache_mix_mode = "batch_weighted"
 # cache_mix_weights = [0.5, 0.5]
 
 # x-pred checkpoint 输出目录。
-output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train"
+output_dir = "./anima-xpred-train"
 
 # 训练 epoch 数。max_train_steps 未设置时，会按 cache 样本数和有效 batch 自动计算。
 num_train_epochs = 1.0
@@ -337,12 +340,12 @@ sample_eps_floor = 1e-4
 # sample_seed = 20260701
 
 # 训练中 sample 输出目录；删除或留空时写到 output_dir/train-samples。
-# sample_output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/train-samples"
+# sample_output_dir = "./anima-xpred-train/train-samples"
 
-# true 时训练中 sample 会用 VAE decode PNG；wandb_enabled=true 时可同步记录到 wandb sample/images。
+# true 时训练中 sample 会用 VAE decode PNG。
 sample_decode_images = true
 sample_image_prefix = "xpred-train-sample"
-sample_wandb_log_images = true
+sample_tracker_log_images = false
 
 # 普通训练 sample 的 LoRA 分支；"__inherit__" 表示继承 [build_cache].teacher_lora。
 # 会额外保存/上传一组 sample-lora 图，用来检查加速 LoRA 对当前 x-pred student 的影响。
@@ -372,11 +375,11 @@ sample_compare_eps_floor = 1e-4
 # sample_compare_height = 1024
 # sample_compare_seed = 20260701
 
-# 可选：把已经生成的 teacher/alpha-0 基准图移动到 compare-baseline，并上传 wandb。
+# 可选：把已经生成的 teacher/alpha-0 基准图移动到 compare-baseline。
 # 只会在本次进程第一次训练中 compare 时导入一次。
-sample_compare_baseline_source_dir = "/root/shared-nvme/RUM-anima-xpred/compare-baseline"
-sample_compare_baseline_output_dir = "/root/shared-nvme/RUM-anima-xpred/compare-baseline"
-sample_compare_baseline_wandb_log_images = true
+sample_compare_baseline_source_dir = "./compare-baseline"
+sample_compare_baseline_output_dir = "./compare-baseline"
+sample_compare_baseline_tracker_log_images = false
 
 # 训练中 compare 的 LoRA 分支；"__inherit__" 表示继承 [build_cache].teacher_lora。
 # 设为 "" 可只生成 fm/x 两张，不生成 fm_lora/x_lora。
@@ -391,20 +394,20 @@ sample_compare_teacher_sanity_lora = "__inherit__"
 sample_compare_teacher_sanity_lora_weight = 1.0
 
 # 输出目录留空时写到 output_dir/train-compare-samples/step-XXXXXX。
-# sample_compare_output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/train-compare-samples"
+# sample_compare_output_dir = "./anima-xpred-train/train-compare-samples"
 sample_compare_decode_images = true
 sample_compare_image_prefix = "compare-train"
-sample_compare_wandb_log_images = true
+sample_compare_tracker_log_images = false
 
 # true 时只跑一个 optimizer step、打印统计，不保存 checkpoint。
 dry_run = false
 
 [sample_xpred]
 # train_xpred 输出的 x-pred checkpoint。不能用旧 FM sampler 加载这个文件采样。
-checkpoint = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/xpred-adapter-checkpoint.safetensors"
+checkpoint = "./anima-xpred-train/xpred-adapter-checkpoint.safetensors"
 
 # 当前 sampler 输出 final latent tensor，不直接 decode 成图片。
-output = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/sample-latent.pt"
+output = "./anima-xpred-train/sample-latent.pt"
 
 # 专用 x-pred sampler 的 prompt。
 prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
@@ -426,19 +429,19 @@ eps_floor = 1e-4
 decode_sample_images = true
 
 # 解码图片输出目录；删除或留空时使用 output 去掉后缀后的同名目录。
-sample_image_dir = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/sample-images"
+sample_image_dir = "./anima-xpred-train/sample-images"
 
 # PNG 文件名前缀。
 sample_image_prefix = "xpred-sample"
 
-# wandb_enabled=true 且 decode_sample_images=true 时，将 PNG 作为 wandb.Image 记录到 sample/images。
-wandb_log_sample_images = true
+# decode_sample_images=true 时，将 PNG 保存到本地 sample image 目录。
+tracker_log_sample_images = false
 
 [sample_compare]
 # Debug 对比采样：alpha=0 是 teacher/FM velocity，alpha=1 是 student x-pred 转 velocity。
-student_checkpoint = "/root/shared-nvme/RUM-anima-xpred/anima-xpred-train/xpred-adapter-checkpoint.safetensors"
-teacher_checkpoint = "/root/shared-nvme/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
-output_dir = "/root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks"
+student_checkpoint = "./anima-xpred-train/xpred-adapter-checkpoint.safetensors"
+teacher_checkpoint = "models/anima/diffusion_models/anima-base-v1.0.safetensors"
+output_dir = "./anima-jlt-xpred-turbo10-chunks"
 prediction_type = "x"
 prompt = 'hatsune miku, 1girl, :3, aqua eyes, aqua hair, aqua nails, aqua necktie, aqua ribbon, bandaid, bandaid on leg, belt, character doll, closed mouth, doll, drop shadow, feet out of frame, fuwapuchi, hair between eyes, heart, holding, long hair, long sleeves, looking at viewer, miku day, necktie, ribbon, shadow, shirt, simple background, smile, socks, solo, spring onion, star \(symbol\), stuffed toy, thigh strap, twintails, very long hair, white background'
 num_samples = 2
@@ -450,4 +453,4 @@ alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
 teacher_cfg = 1.0
 decode_sample_images = true
 sample_image_prefix = "compare"
-wandb_log_sample_images = true
+tracker_log_sample_images = false

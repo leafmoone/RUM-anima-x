@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import random
 from pathlib import Path
 
@@ -87,17 +88,36 @@ def bucket_cache_path(cache_dir: Path, sample_index: int, *, width: int, height:
 
 def collect_cache_buckets(cache_dir: str | Path) -> list[CacheBucket]:
     root = Path(cache_dir)
-    buckets: list[CacheBucket] = []
-    root_files = sorted(root.glob("*.safetensors"), key=cache_file_sort_key)
-    if root_files:
-        buckets.append(CacheBucket(name="root", files=root_files))
-    for child in sorted(root.iterdir() if root.exists() else [], key=lambda path: path.name):
-        if not child.is_dir():
-            continue
-        files = sorted(child.glob("*.safetensors"), key=cache_file_sort_key)
-        if files:
-            buckets.append(CacheBucket(name=child.name, files=files))
-    return buckets
+    if not root.exists():
+        return []
+
+    bucket_files: dict[str, list[Path]] = {}
+    seen_files: set[Path] = set()
+
+    def add_files(bucket_name: str, files: list[Path]) -> None:
+        for file in files:
+            resolved = file.resolve()
+            if resolved in seen_files:
+                continue
+            seen_files.add(resolved)
+            bucket_files.setdefault(bucket_name, []).append(file)
+
+    add_files("root", sorted(root.glob("*.safetensors"), key=cache_file_sort_key))
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        dirnames[:] = sorted(name for name in dirnames if not (current / name).is_symlink())
+        files = sorted(
+            [current / filename for filename in filenames if filename.endswith(".safetensors")],
+            key=cache_file_sort_key,
+        )
+        if files and current != root:
+            add_files(current.name, files)
+
+    return [
+        CacheBucket(name=name, files=sorted(files, key=cache_file_sort_key))
+        for name, files in bucket_files.items()
+        if files
+    ]
 
 
 def merge_cache_samples(paths: list[Path], device: torch.device, dtype: torch.dtype) -> dict:
@@ -307,16 +327,46 @@ def allocate_weighted_counts(batch_size: int, weights: list[float]) -> list[int]
         raise ValueError("batch_size must be >= 1")
     if not weights:
         raise ValueError("at least one weight is required")
-    if any(weight < 0 for weight in weights) or sum(weights) <= 0:
-        raise ValueError("cache mix weights must be non-negative and sum to > 0")
-    total = float(sum(weights))
-    raw = [batch_size * float(weight) / total for weight in weights]
+    normalized_weights, total = _normalize_cache_mix_weights(
+        weights,
+        error_message="cache mix weights must be non-negative and sum to > 0",
+    )
+    raw = [batch_size * weight / total for weight in normalized_weights]
     counts = [int(math.floor(value)) for value in raw]
     remaining = batch_size - sum(counts)
     order = sorted(range(len(weights)), key=lambda index: raw[index] - counts[index], reverse=True)
     for index in order[:remaining]:
         counts[index] += 1
     return counts
+
+
+def allocate_random_weighted_counts(batch_size: int, weights: list[float], rng: random.Random) -> list[int]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if not weights:
+        raise ValueError("at least one weight is required")
+    normalized_weights, total = _normalize_cache_mix_weights(
+        weights,
+        error_message="cache mix weights must be non-negative and sum to > 0",
+    )
+    counts = [0] * len(weights)
+    for _ in range(batch_size):
+        pick = rng.random() * total
+        cumulative = 0.0
+        for index, weight in enumerate(normalized_weights):
+            cumulative += weight
+            if pick < cumulative:
+                counts[index] += 1
+                break
+    return counts
+
+
+def _normalize_cache_mix_weights(weights: list[float], *, error_message: str) -> tuple[list[float], float]:
+    normalized_weights = [float(weight) for weight in weights]
+    total = float(sum(normalized_weights))
+    if any(weight < 0 for weight in normalized_weights) or total <= 0:
+        raise ValueError(error_message)
+    return normalized_weights, total
 
 
 class MultiCacheBucketBatchCursor:
@@ -341,9 +391,10 @@ class MultiCacheBucketBatchCursor:
             weights = [1.0] * len(cache_bucket_sets)
         if len(weights) != len(cache_bucket_sets):
             raise ValueError("cache_mix_weights length must match cache_dirs length")
-        self.weights = [float(weight) for weight in weights]
-        if any(weight < 0 for weight in self.weights) or sum(self.weights) <= 0:
-            raise ValueError("cache_mix_weights must be non-negative and sum to > 0")
+        self.weights, _ = _normalize_cache_mix_weights(
+            weights,
+            error_message="cache_mix_weights must be non-negative and sum to > 0",
+        )
 
         bucket_names = sorted({bucket.name for buckets in cache_bucket_sets for bucket in buckets})
         self.bucket_groups: list[tuple[str, list[tuple[int, CacheBatchCursor]]]] = []
@@ -383,7 +434,10 @@ class MultiCacheBucketBatchCursor:
         _, source_cursors = self.bucket_groups[group_index]
         source_indices = [source_index for source_index, _ in source_cursors]
         weights = [self.weights[source_index] for source_index in source_indices]
-        counts = allocate_weighted_counts(self.batch_size, weights)
+        if self.shuffle:
+            counts = allocate_random_weighted_counts(self.batch_size, weights, self.rng)
+        else:
+            counts = allocate_weighted_counts(self.batch_size, weights)
         selected: list[Path] = []
         for count, (_, cursor) in zip(counts, source_cursors):
             selected.extend(cursor.next_count(count))

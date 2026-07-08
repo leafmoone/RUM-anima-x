@@ -4,7 +4,7 @@ This directory contains maintained command-line entrypoints.
 
 - `dev/anima_rum_xpred_train.py` - RUM reflow latent x-pred experiment CLI.
 - `dev/import_chunked_cache.py` - import exported cache bucket tar files into `chunked_rum` `cache/chunk-XXXX` folders by sample index.
-- `dev/import_anima_jlt_cache.py` - project-local import wrapper with the current Anima JLT cache paths written into the script.
+- `dev/import_anima_jlt_cache.py` - project-local import wrapper for prepared cache archives.
 
 Current experiment wrapper:
 
@@ -12,14 +12,14 @@ Current experiment wrapper:
 python scripts/dev/import_anima_jlt_cache.py
 ```
 
-Edit `SOURCE_DIRS` at the top of that script when new transferred cache folders arrive.
+Edit `SOURCE_DIRS` at the top of that script when new cache folders are ready.
 
 Example:
 
 ```bash
 python scripts/dev/import_chunked_cache.py \
-  --src /root/shared-nvme/cache/095182-100212 \
-  --chunk-root /root/shared-nvme/RUM-anima-xpred/anima-jlt-xpred-turbo10-chunks \
+  --src cache_data/095182-100212 \
+  --chunk-root ./anima-jlt-xpred-turbo10-chunks \
   --start-index 69000 \
   --chunk-size 3000
 ```

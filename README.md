@@ -75,19 +75,13 @@ local teacher vector-field conversion
 
 ## ComfyUI Nodes
 
-The ComfyUI nodes have been moved to a separate repository:
-
-```text
-https://github.com/leafmoone/ComfyUI-RUM-Anima-XPred
-```
-
-They are separate because x-pred checkpoints cannot be sampled with ordinary Anima/FM velocity sampler nodes. The model output is clean latent `x`, so ComfyUI sampling must stay in x-pred mode and only read out:
+ComfyUI nodes are not included in this repository. X-pred checkpoints cannot be sampled with ordinary Anima/FM velocity sampler nodes. The model output is clean latent `x`, so any UI integration must stay in x-pred mode and only read out:
 
 ```text
 v = (z - x_pred) / sigma
 ```
 
-as the Euler update direction inside the sampler. A dedicated node package keeps that checkpoint semantics explicit and avoids wiring an x-pred checkpoint into a velocity-prediction workflow by mistake.
+as the Euler update direction inside the sampler.
 
 
 
@@ -126,7 +120,6 @@ Disadvantages:
 
 - `src/rum_xpred/` - x-pred formula, cache, sampler, and local Anima adapter.
 - `scripts/dev/anima_rum_xpred_train.py` - experiment CLI.
-- `scripts/dev/upload_completed_cache_chunks.py` - project-local cache packaging/upload helper.
 - `configs/anima_xpred.example.toml` - commented config covering cache, train, and sample.
 - `configs/anima_vpred_reflow.example.toml` - optional velocity reflow control config using the same cache format.
 - `vendor/sd-scripts/` - copied local Anima/kohya code used by the adapter.
@@ -148,9 +141,9 @@ python scripts/dev/anima_rum_xpred_train.py chunked_rum --config configs/anima_x
 
 Without a subcommand, the script uses `command` from the config. With a subcommand, the subcommand selects the stage. The same config can contain `[build_cache]`, `[train_xpred]`, and `[sample_xpred]` sections.
 
-The example config includes the normal experiment controls: cache start index, cache batch size, skip-existing resume behavior, optional built-in resolution bucketing, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, shuffle/drop-last, periodic checkpoints, gradient checkpointing, wandb logging, dry run, and sample count.
+The example config includes the normal experiment controls: cache start index, cache batch size, skip-existing resume behavior, optional built-in resolution bucketing, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, shuffle/drop-last, periodic checkpoints, gradient checkpointing, local logging, dry run, and sample count.
 
-In the current workspace, `configs/anima_xpred.example.toml` is also the live experiment config. Inspect it before editing because it contains real paths, W&B run settings, chunk offsets, and sample/compare settings.
+Use `configs/anima_xpred.example.toml` as a publishable template. Keep live experiment overrides in an ignored local config such as `configs/train.local.toml`.
 
 Set `[build_cache].bucket_enabled = true` to use the built-in fixed resolution buckets. Cache files are written under `cache_dir/<width>x<height>/`; training discovers those subdirectories automatically and samples each optimizer micro-batch from one bucket so latent shapes do not mix inside a batch.
 
@@ -158,7 +151,7 @@ Training is epoch-driven by default: omit `max_train_steps` and set `num_train_e
 
 The default training mode is still `prediction_type = "x"`. A v-pred reflow control path is available with `prediction_type = "v"` in both `[train_xpred]` and `[sample_xpred]`; use `configs/anima_vpred_reflow.example.toml` for that experiment.
 
-Training-time sample previews are supported but disabled by default. Set `[train_xpred].sample_every_steps` to a positive interval to save preview latents under `<output_dir>/train-samples/`; enable `sample_decode_images` and wandb to also log decoded PNGs as `sample/images`.
+Training-time sample previews are supported but disabled by default. Set `[train_xpred].sample_every_steps` to a positive interval to save preview latents under `<output_dir>/train-samples/`; enable `sample_decode_images` to also save decoded PNGs locally.
 
 
 
