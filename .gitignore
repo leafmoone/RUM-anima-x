@@ -24,6 +24,7 @@ __pycache__/
 !.env.example
 configs/*.local.toml
 configs/anima_xpred.tag_*.toml
+scripts/dev/upload_completed_cache_chunks.py
 
 # Logs and experiment trackers
 logs/
