@@ -122,33 +122,53 @@ def enable_model_gradient_checkpointing(student: torch.nn.Module, args: argparse
             student.enable_gradient_checkpointing()
 
 
-def init_tracker(args: argparse.Namespace):
-    return None
+def init_wandb(args: argparse.Namespace):
+    if not getattr(args, "wandb_enabled", False):
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError("wandb_enabled=true but wandb is not installed. Install requirements.txt or disable wandb.") from exc
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_run_name,
+        "id": getattr(args, "wandb_run_id", None),
+        "resume": getattr(args, "wandb_resume", None),
+        "mode": args.wandb_mode,
+        "tags": args.wandb_tags,
+        "notes": args.wandb_notes,
+    }
+    init_kwargs = {key: value for key, value in init_kwargs.items() if value not in (None, [], "")}
+    if args.wandb_log_config:
+        init_kwargs["config"] = serializable_args(args)
+    return wandb.init(**init_kwargs)
 
 
-def log_sample_images_to_tracker(
-    tracker_run,
+def log_sample_images_to_wandb(
+    wandb_run,
     image_paths: list[Path],
     prompt: str,
     step: int | None = None,
     *,
     key: str = "sample/images",
 ) -> None:
-    if tracker_run is None or not image_paths:
+    if wandb_run is None or not image_paths:
         return
+    import wandb
 
-    images = [{"path": str(path), "caption": sample_image_caption(path, prompt)} for path in image_paths]
+    images = [wandb.Image(str(path), caption=sample_image_caption(path, prompt)) for path in image_paths]
     payload = {key: images}
     if step is not None:
         step_key = f"{key[:-len('/images')]}/step" if key.endswith("/images") else f"{key}/step"
         payload[step_key] = step
-    current_step = getattr(tracker_run, "step", None)
+    current_step = getattr(wandb_run, "step", None)
     if step is None or (current_step is not None and step < current_step):
         if step is not None and current_step is not None and step < current_step:
-            print(f"tracker media step {step} is behind current step {current_step}; logging without explicit step")
-        tracker_run.log(payload)
+            print(f"wandb media step {step} is behind current step {current_step}; logging without explicit step")
+        wandb_run.log(payload)
     else:
-        tracker_run.log(payload, step=step)
+        wandb_run.log(payload, step=step)
 
 
 def sample_image_caption(path: Path, prompt: str) -> str:
@@ -188,7 +208,7 @@ def find_image_files(path: str | Path | None) -> list[Path]:
     )
 
 
-def maybe_import_compare_baseline(args: argparse.Namespace, tracker_run=None) -> list[Path]:
+def maybe_import_compare_baseline(args: argparse.Namespace, wandb_run=None) -> list[Path]:
     if getattr(args, "sample_compare_baseline_imported", False):
         return []
     source_dir = getattr(args, "sample_compare_baseline_source_dir", None)
@@ -202,7 +222,7 @@ def maybe_import_compare_baseline(args: argparse.Namespace, tracker_run=None) ->
         return []
     output_root = Path(getattr(args, "sample_compare_baseline_output_dir", None) or REPO_ROOT / "compare-baseline")
     output_root.mkdir(parents=True, exist_ok=True)
-    marker_path = output_root / ".tracker_uploaded"
+    marker_path = output_root / ".wandb_uploaded"
     copied: list[Path] = []
     for index, source in enumerate(source_images):
         target = output_root / f"teacher-baseline-{index:04d}{source.suffix.lower()}"
@@ -210,15 +230,15 @@ def maybe_import_compare_baseline(args: argparse.Namespace, tracker_run=None) ->
             shutil.copy2(source, target)
         copied.append(target)
     print(f"imported {len(copied)} compare baseline image(s) to {output_root}")
-    if getattr(args, "sample_compare_baseline_tracker_log_images", True) and not marker_path.exists():
+    if getattr(args, "sample_compare_baseline_wandb_log_images", True) and not marker_path.exists():
         prompt = getattr(args, "sample_compare_prompt", None) or getattr(args, "sample_prompt", "")
-        log_sample_images_to_tracker(tracker_run, copied, prompt, key="sample_compare/baseline")
+        log_sample_images_to_wandb(wandb_run, copied, prompt, key="sample_compare/baseline")
         marker_path.write_text("uploaded\n", encoding="utf-8")
     args.sample_compare_baseline_imported = True
     return copied
 
 
-def read_tracker_metrics_file(path: str | None) -> dict[str, float]:
+def read_wandb_metrics_file(path: str | None) -> dict[str, float]:
     if not path:
         return {}
     metrics_path = Path(path)
@@ -226,7 +246,7 @@ def read_tracker_metrics_file(path: str | None) -> dict[str, float]:
         return {}
     data = json.loads(metrics_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError(f"tracker metrics file must contain a JSON object: {metrics_path}")
+        raise ValueError(f"wandb metrics file must contain a JSON object: {metrics_path}")
     aliases = {
         "fid": "eval/fid",
         "FID": "eval/fid",
@@ -378,7 +398,7 @@ def sample_from_training_student(
     device: torch.device,
     dtype: torch.dtype,
     global_step: int,
-    tracker_run=None,
+    wandb_run=None,
 ) -> list[Path]:
     total_step = getattr(args, "global_step_offset", 0) + global_step
     sample_width = args.sample_width or getattr(args, "width", None) or 1024
@@ -511,8 +531,8 @@ def sample_from_training_student(
             if lora_latent is not None:
                 image_paths.extend(adapter.decode_latents_to_images(lora_latent, image_dir / "lora", prefix=f"{args.sample_image_prefix}-lora"))
             print(f"saved {len(image_paths)} training sample image(s) to {image_dir}")
-            if args.sample_tracker_log_images:
-                log_sample_images_to_tracker(tracker_run, image_paths, args.sample_prompt, step=total_step)
+            if args.sample_wandb_log_images:
+                log_sample_images_to_wandb(wandb_run, image_paths, args.sample_prompt, step=total_step)
     print(f"saved training sample latent tensor to {latent_path}")
     del x_latent, sigmas, eps_latent
     if lora_latent is not None:
@@ -532,7 +552,7 @@ def sample_compare_from_training_student(
     device: torch.device,
     dtype: torch.dtype,
     global_step: int,
-    tracker_run=None,
+    wandb_run=None,
 ) -> list[Path]:
     if args.prediction_type != "x":
         raise ValueError("training sample_compare currently requires prediction_type='x'")
@@ -696,8 +716,8 @@ def sample_compare_from_training_student(
                     )
                 )
             print(f"saved {len(image_paths)} training compare image(s) to {step_dir / 'images'}")
-            if args.sample_compare_tracker_log_images:
-                log_sample_images_to_tracker(tracker_run, image_paths, prompt, step=total_step, key="sample_compare/images")
+            if args.sample_compare_wandb_log_images:
+                log_sample_images_to_wandb(wandb_run, image_paths, prompt, step=total_step, key="sample_compare/images")
     print(f"saved training compare latent tensor to {latent_path}")
     del results, sigmas, eps_latent
     release_cuda_memory()
@@ -1170,7 +1190,7 @@ def train_xpred(args: argparse.Namespace) -> None:
             f"effective_batch_size={args.train_batch_size * args.gradient_accumulation_steps}, "
             f"num_train_epochs={args.num_train_epochs}"
         )
-    tracker_run = init_tracker(args)
+    wandb_run = init_wandb(args)
 
     losses: list[float] = []
     completed_train_steps = 0
@@ -1179,8 +1199,8 @@ def train_xpred(args: argparse.Namespace) -> None:
             global_step = step + 1
             total_step = getattr(args, "global_step_offset", 0) + global_step
             should_log_console = global_step % args.log_every == 0
-            should_log_tracker = tracker_run is not None
-            should_compute_source_metrics = bool(cache_dirs) and (should_log_console or should_log_tracker)
+            should_log_wandb = wandb_run is not None
+            should_compute_source_metrics = bool(cache_dirs) and (should_log_console or should_log_wandb)
             current_lr = args.learning_rate * lr_scale_for_step(args, total_step)
             set_optimizer_lr(optimizer, current_lr)
             optimizer.zero_grad(set_to_none=True)
@@ -1267,9 +1287,9 @@ def train_xpred(args: argparse.Namespace) -> None:
                 if values
             }
             losses.append(float(loss))
-            if tracker_run is not None:
+            if wandb_run is not None:
                 grad_norm_value = None if grad_norm is None else float(grad_norm)
-                tracker_metrics = {
+                wandb_metrics = {
                     "train/loss": float(loss),
                     "train/x_mse": float(x_mse),
                     "train/lr": current_lr,
@@ -1278,12 +1298,12 @@ def train_xpred(args: argparse.Namespace) -> None:
                     "train/effective_batch_size": args.train_batch_size * args.gradient_accumulation_steps,
                 }
                 for name, source_loss in source_losses.items():
-                    tracker_metrics[f"train/loss_by_cache/{name}"] = float(source_loss)
+                    wandb_metrics[f"train/loss_by_cache/{name}"] = float(source_loss)
                 for name, source_x_mse in source_x_mses.items():
-                    tracker_metrics[f"train/x_mse_by_cache/{name}"] = float(source_x_mse)
-                    if args.tracker_metrics_log_every > 0 and global_step % args.tracker_metrics_log_every == 0:
-                        tracker_metrics.update(read_tracker_metrics_file(args.tracker_metrics_file))
-                    tracker_run.log(tracker_metrics, step=total_step)
+                    wandb_metrics[f"train/x_mse_by_cache/{name}"] = float(source_x_mse)
+                    if args.wandb_metrics_log_every > 0 and global_step % args.wandb_metrics_log_every == 0:
+                        wandb_metrics.update(read_wandb_metrics_file(args.wandb_metrics_file))
+                    wandb_run.log(wandb_metrics, step=total_step)
             if should_log_console:
                 grad_text = "" if grad_norm is None else f" grad_norm={float(grad_norm):.6f}"
                 offset_text = "" if getattr(args, "global_step_offset", 0) == 0 else f" total_step={total_step}"
@@ -1309,10 +1329,10 @@ def train_xpred(args: argparse.Namespace) -> None:
                     device=device,
                     dtype=dtype,
                     global_step=global_step,
-                    tracker_run=tracker_run,
+                    wandb_run=wandb_run,
                 )
             if run_train_compare:
-                maybe_import_compare_baseline(args, tracker_run=tracker_run)
+                maybe_import_compare_baseline(args, wandb_run=wandb_run)
                 sample_compare_from_training_student(
                     student=student,
                     adapter=adapter,
@@ -1320,7 +1340,7 @@ def train_xpred(args: argparse.Namespace) -> None:
                     device=device,
                     dtype=dtype,
                     global_step=global_step,
-                    tracker_run=tracker_run,
+                    wandb_run=wandb_run,
                 )
             if args.dry_run:
                 print("dry_run=true: completed one optimizer step and skipped checkpoint saving")
@@ -1333,8 +1353,8 @@ def train_xpred(args: argparse.Namespace) -> None:
                     adapter.save_student_xpred(student, step_checkpoint)
                     prune_checkpoints(output_dir, args.checkpoints_total_limit, prediction_type=args.prediction_type)
     finally:
-        if tracker_run is not None:
-            tracker_run.finish()
+        if wandb_run is not None:
+            wandb_run.finish()
 
     if args.dry_run:
         return
@@ -1422,13 +1442,13 @@ def sample_xpred(args: argparse.Namespace) -> None:
         image_paths = adapter.decode_latents_to_images(x_latent, image_dir, prefix=args.sample_image_prefix)
         print(f"saved {len(image_paths)} decoded sample image(s) to {image_dir}")
 
-    tracker_run = init_tracker(args)
+    wandb_run = init_wandb(args)
     try:
-        if args.tracker_log_sample_images:
-            log_sample_images_to_tracker(tracker_run, image_paths, args.prompt)
+        if args.wandb_log_sample_images:
+            log_sample_images_to_wandb(wandb_run, image_paths, args.prompt)
     finally:
-        if tracker_run is not None:
-            tracker_run.finish()
+        if wandb_run is not None:
+            wandb_run.finish()
     del eps_latent, sigmas, x_latent
     if "student" in locals():
         del student
@@ -1536,11 +1556,11 @@ def sample_compare(args: argparse.Namespace) -> None:
             for key, latent in results.items():
                 image_paths.extend(adapter.decode_latents_to_images(latent, output_dir / "images" / key, prefix=f"{args.sample_image_prefix}-{key}"))
             print(f"saved {len(image_paths)} compare image(s) to {output_dir / 'images'}")
-            tracker_run = init_tracker(args)
-            if args.tracker_log_sample_images:
-                log_sample_images_to_tracker(tracker_run, image_paths, args.prompt, step=None, key="sample_compare/images")
-            if tracker_run is not None:
-                tracker_run.finish()
+            wandb_run = init_wandb(args)
+            if args.wandb_log_sample_images:
+                log_sample_images_to_wandb(wandb_run, image_paths, args.prompt, step=None, key="sample_compare/images")
+            if wandb_run is not None:
+                wandb_run.finish()
     release_cuda_memory()
 
 
@@ -1573,19 +1593,19 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--text_encoder_cpu", action="store_true")
 
 
-def add_tracker_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--tracker_enabled", action="store_true")
-    parser.add_argument("--tracker_project", default="rum-anima-xpred")
-    parser.add_argument("--tracker_entity", default=None)
-    parser.add_argument("--tracker_run_name", default=None)
-    parser.add_argument("--tracker_run_id", default=None)
-    parser.add_argument("--tracker_resume", default=None)
-    parser.add_argument("--tracker_mode", default=None)
-    parser.add_argument("--tracker_tags", nargs="*", default=[])
-    parser.add_argument("--tracker_notes", default=None)
-    parser.add_argument("--tracker_log_config", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--tracker_metrics_file", default=None)
-    parser.add_argument("--tracker_metrics_log_every", type=int, default=1)
+def add_wandb_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--wandb_enabled", action="store_true")
+    parser.add_argument("--wandb_project", default="rum-anima-xpred")
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_run_id", default=None)
+    parser.add_argument("--wandb_resume", default=None)
+    parser.add_argument("--wandb_mode", default=None)
+    parser.add_argument("--wandb_tags", nargs="*", default=[])
+    parser.add_argument("--wandb_notes", default=None)
+    parser.add_argument("--wandb_log_config", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wandb_metrics_file", default=None)
+    parser.add_argument("--wandb_metrics_log_every", type=int, default=1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1660,7 +1680,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sample_output_dir", default=None)
     train.add_argument("--sample_decode_images", action="store_true")
     train.add_argument("--sample_image_prefix", default="train-sample")
-    train.add_argument("--sample_tracker_log_images", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--sample_wandb_log_images", action=argparse.BooleanOptionalAction, default=True)
     train.add_argument("--sample_lora", default="__inherit__")
     train.add_argument("--sample_lora_weight", type=float, default=None)
     train.add_argument("--sample_lora_steps", type=int, default=None)
@@ -1678,7 +1698,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sample_compare_output_dir", default=None)
     train.add_argument("--sample_compare_baseline_source_dir", default=None)
     train.add_argument("--sample_compare_baseline_output_dir", default=None)
-    train.add_argument("--sample_compare_baseline_tracker_log_images", action=argparse.BooleanOptionalAction, default=True)
+    train.add_argument("--sample_compare_baseline_wandb_log_images", action=argparse.BooleanOptionalAction, default=True)
     train.add_argument("--sample_compare_lora", default="__inherit__")
     train.add_argument("--sample_compare_lora_weight", type=float, default=None)
     train.add_argument("--sample_compare_lora_cfg", type=float, default=None)
@@ -1687,8 +1707,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--sample_compare_teacher_sanity_lora_weight", type=float, default=None)
     train.add_argument("--sample_compare_decode_images", action="store_true")
     train.add_argument("--sample_compare_image_prefix", default="compare")
-    train.add_argument("--sample_compare_tracker_log_images", action=argparse.BooleanOptionalAction, default=True)
-    add_tracker_args(train)
+    train.add_argument("--sample_compare_wandb_log_images", action=argparse.BooleanOptionalAction, default=True)
+    add_wandb_args(train)
     train.add_argument("--dry_run", action="store_true")
     train.set_defaults(func=train_xpred)
 
@@ -1706,8 +1726,8 @@ def parse_args() -> argparse.Namespace:
     sample.add_argument("--decode_sample_images", action="store_true")
     sample.add_argument("--sample_image_dir", default=None)
     sample.add_argument("--sample_image_prefix", default="sample")
-    sample.add_argument("--tracker_log_sample_images", action=argparse.BooleanOptionalAction, default=True)
-    add_tracker_args(sample)
+    sample.add_argument("--wandb_log_sample_images", action=argparse.BooleanOptionalAction, default=True)
+    add_wandb_args(sample)
     sample.set_defaults(func=sample_xpred)
 
     compare = subparsers.add_parser("sample_compare", help="Compare teacher FM, mixed velocity, and student x-pred sampling.")
@@ -1728,13 +1748,13 @@ def parse_args() -> argparse.Namespace:
     compare.add_argument("--teacher_cfg", type=float, default=DEFAULT_TEACHER_CFG)
     compare.add_argument("--decode_sample_images", action="store_true")
     compare.add_argument("--sample_image_prefix", default="compare")
-    compare.add_argument("--tracker_log_sample_images", action=argparse.BooleanOptionalAction, default=True)
-    add_tracker_args(compare)
+    compare.add_argument("--wandb_log_sample_images", action=argparse.BooleanOptionalAction, default=True)
+    add_wandb_args(compare)
     compare.set_defaults(func=sample_compare)
 
     chunked_stage = subparsers.add_parser("chunked_rum", help="Build cache chunks and train after each chunk with resume manifest.")
     add_common_args(chunked_stage)
-    add_tracker_args(chunked_stage)
+    add_wandb_args(chunked_stage)
     chunked_stage.add_argument("--chunk_root", default=None, help="Root directory for rolling cache chunks, train outputs, and manifest.")
     chunked_stage.add_argument("--total_samples", type=int, default=None, help="Total samples to process across all chunks.")
     chunked_stage.add_argument("--chunk_size", type=int, default=1024, help="Samples per cache/train chunk.")
@@ -1831,8 +1851,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("lr_cosine_min must be in [0, 1]")
     if hasattr(args, "lr_scheduler_total_steps") and args.lr_scheduler_total_steps is not None and args.lr_scheduler_total_steps < 1:
         parser.error("lr_scheduler_total_steps must be >= 1")
-    if hasattr(args, "tracker_metrics_log_every") and args.tracker_metrics_log_every < 0:
-        parser.error("tracker_metrics_log_every must be >= 0")
+    if hasattr(args, "wandb_metrics_log_every") and args.wandb_metrics_log_every < 0:
+        parser.error("wandb_metrics_log_every must be >= 0")
     if hasattr(args, "sample_every_steps") and args.sample_every_steps < 0:
         parser.error("sample_every_steps must be >= 0")
     if hasattr(args, "sample_steps") and args.sample_steps < 1:

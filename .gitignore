@@ -28,7 +28,7 @@ scripts/dev/upload_completed_cache_chunks.py
 
 # Logs and experiment trackers
 logs/
-tracker/
+wandb/
 compare-baseline/
 
 # Generated outputs

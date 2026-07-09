@@ -35,7 +35,7 @@ pytest -q
 Use `configs/anima_xpred.example.toml` as the main editable config. It contains every normal option for all three stages:
 
 - `[common]`: shared device, precision, Anima model paths, adapter, seed, attention mode, and FP8/text-encoder placement flags.
-- Optional tracker fields are disabled by default. `train/grad_norm` is logged directly by the trainer; FID/IS can be read from a local metrics JSON file when a local evaluator writes values such as `{"fid": 12.3, "is": 5.6}`.
+- Optional wandb fields are disabled by default. `train/grad_norm` is logged directly by the trainer; FID/IS can be read from a local metrics JSON file when a local evaluator writes values such as `{"fid": 12.3, "is": 5.6}`.
 - `[build_cache]`: prompt file, cache directory, start index, cache batch size, skip-existing resume behavior, resolution, teacher steps, teacher CFG.
 - `[train_xpred]`: cache directory, output directory, `prediction_type`, epoch/step count, train batch size, gradient accumulation, AdamW parameters, LR scheduler, grad clipping, sigma lower bound, shuffle/drop-last, logging interval, periodic checkpoints, gradient checkpointing, optional training-time sampling, dry run. If `max_train_steps` is omitted, steps are computed from `num_train_epochs`, cache sample count, and effective batch size.
 - `[sample_xpred]`: checkpoint, `prediction_type`, latent output path, prompt, sample count, sampler steps, resolution, epsilon floor.
@@ -249,7 +249,7 @@ cache_mix_weights = [0.5, 0.5]
 
 The trainer draws each micro-batch from one resolution bucket and splits samples across cache directories according to the weights. With `train_batch_size = 8` and weights `[0.5, 0.5]`, each micro-batch contains four samples from each directory when both have the selected bucket.
 
-Training always logs `train/x_mse`, the clean-latent MSE against `x_teacher_latent`, even when the active training objective is JLT velocity-readout loss. When multiple cache directories are active, the tracker payload also includes `train/loss_by_cache/<cache-name>` and `train/x_mse_by_cache/<cache-name>`. For chunked paths such as `tag/chunk-0014`, the cache name is `tag`.
+Training always logs `train/x_mse`, the clean-latent MSE against `x_teacher_latent`, even when the active training objective is JLT velocity-readout loss. When multiple cache directories are active, the wandb payload also includes `train/loss_by_cache/<cache-name>` and `train/x_mse_by_cache/<cache-name>`. For chunked paths such as `tag/chunk-0014`, the cache name is `tag`.
 
 The student starts from `[common].student_init`; if that is empty, it falls back to `[common].dit`.
 

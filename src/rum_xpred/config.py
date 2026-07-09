@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
 
 
 COMMANDS = {"build_cache", "train_xpred", "sample_xpred", "sample_compare", "chunked_rum"}
-LEGACY_TRACKER_SECTION = "wa" + "ndb"
+LEGACY_WANDB_SECTION = "wa" + "ndb"
 LEGACY_PREPARED_CACHE_ONLY = "ex" + "ternal_cache_only"
 PROMPT_SET_KEYS = {"name", "prompts", "cache_dir", "start_index", "num_samples", "cache_chunk_offset", "repeat"}
 
@@ -106,7 +106,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "sample_output_dir": None,
         "sample_decode_images": False,
         "sample_image_prefix": "train-sample",
-        "sample_tracker_log_images": True,
+        "sample_wandb_log_images": True,
         "sample_lora": "__inherit__",
         "sample_lora_weight": None,
         "sample_lora_steps": None,
@@ -124,7 +124,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "sample_compare_output_dir": None,
         "sample_compare_baseline_source_dir": None,
         "sample_compare_baseline_output_dir": None,
-        "sample_compare_baseline_tracker_log_images": True,
+        "sample_compare_baseline_wandb_log_images": True,
         "sample_compare_lora": "__inherit__",
         "sample_compare_lora_weight": None,
         "sample_compare_lora_cfg": None,
@@ -133,7 +133,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "sample_compare_teacher_sanity_lora_weight": None,
         "sample_compare_decode_images": False,
         "sample_compare_image_prefix": "compare",
-        "sample_compare_tracker_log_images": True,
+        "sample_compare_wandb_log_images": True,
         "dry_run": False,
     },
     "sample_xpred": {
@@ -149,7 +149,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "decode_sample_images": False,
         "sample_image_dir": None,
         "sample_image_prefix": "sample",
-        "tracker_log_sample_images": True,
+        "wandb_log_sample_images": True,
     },
     "sample_compare": {
         "student_checkpoint": None,
@@ -168,7 +168,7 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
         "teacher_cfg": 1.0,
         "decode_sample_images": False,
         "sample_image_prefix": "compare",
-        "tracker_log_sample_images": True,
+        "wandb_log_sample_images": True,
     },
     "chunked_rum": {
         "chunk_root": None,
@@ -182,19 +182,19 @@ COMMAND_DEFAULTS: dict[str, dict[str, Any]] = {
     },
 }
 
-TRACKER_DEFAULTS: dict[str, Any] = {
-    "tracker_enabled": False,
-    "tracker_project": "rum-anima-xpred",
-    "tracker_entity": None,
-    "tracker_run_name": None,
-    "tracker_run_id": None,
-    "tracker_resume": None,
-    "tracker_mode": None,
-    "tracker_tags": [],
-    "tracker_notes": None,
-    "tracker_log_config": True,
-    "tracker_metrics_file": None,
-    "tracker_metrics_log_every": 1,
+WANDB_DEFAULTS: dict[str, Any] = {
+    "wandb_enabled": False,
+    "wandb_project": "rum-anima-xpred",
+    "wandb_entity": None,
+    "wandb_run_name": None,
+    "wandb_run_id": None,
+    "wandb_resume": None,
+    "wandb_mode": None,
+    "wandb_tags": [],
+    "wandb_notes": None,
+    "wandb_log_config": True,
+    "wandb_metrics_file": None,
+    "wandb_metrics_log_every": 1,
 }
 
 
@@ -257,9 +257,9 @@ def config_to_namespace(config: dict[str, Any], *, command_override: str | None 
             command_values["teacher_lora"] = build_cache_values.get("teacher_lora")
         if command_values.get("teacher_lora_weight") is None:
             command_values["teacher_lora_weight"] = build_cache_values.get("teacher_lora_weight", 1.0)
-    tracker_values = dict(TRACKER_DEFAULTS)
-    tracker_values.update(_section(config, LEGACY_TRACKER_SECTION))
-    tracker_values.update(_section(config, "tracker"))
+    wandb_values = dict(WANDB_DEFAULTS)
+    wandb_values.update(_section(config, LEGACY_WANDB_SECTION))
+    wandb_values.update(_section(config, "wandb"))
     command_config = _section(config, command)
     if command == "chunked_rum" and LEGACY_PREPARED_CACHE_ONLY in command_config:
         command_values["prepared_cache_only"] = command_config[LEGACY_PREPARED_CACHE_ONLY]
@@ -267,7 +267,7 @@ def config_to_namespace(config: dict[str, Any], *, command_override: str | None 
     unknown_sections = sorted(
         key
         for key, value in config.items()
-        if isinstance(value, dict) and key not in {"common", LEGACY_TRACKER_SECTION, "tracker", *COMMANDS}
+        if isinstance(value, dict) and key not in {"common", LEGACY_WANDB_SECTION, "wandb", *COMMANDS}
     )
     if unknown_sections:
         raise ValueError(f"unknown config section(s): {', '.join(unknown_sections)}")
@@ -280,7 +280,7 @@ def config_to_namespace(config: dict[str, Any], *, command_override: str | None 
     if unknown_keys:
         raise ValueError(f"unknown config key(s): {', '.join(unknown_keys)}")
 
-    args = argparse.Namespace(command=command, **common, **command_values, **tracker_values)
+    args = argparse.Namespace(command=command, **common, **command_values, **wandb_values)
     return args
 
 

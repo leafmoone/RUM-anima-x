@@ -35,17 +35,17 @@ fp8 = false
 fp8_scaled = false
 text_encoder_cpu = false
 
-[tracker]
-tracker_enabled = false
-tracker_project = "rum-anima-xpred"
-tracker_entity = ""
-tracker_run_name = "toy-smoke"
-tracker_mode = "offline"
-tracker_tags = ["toy", "smoke"]
-tracker_notes = "Local toy smoke for config validation."
-tracker_log_config = true
-tracker_metrics_file = "outputs/toy-smoke/train/eval-metrics.json"
-tracker_metrics_log_every = 1
+[wandb]
+wandb_enabled = false
+wandb_project = "rum-anima-xpred"
+wandb_entity = ""
+wandb_run_name = "toy-smoke"
+wandb_mode = "offline"
+wandb_tags = ["toy", "smoke"]
+wandb_notes = "Local toy smoke for config validation."
+wandb_log_config = true
+wandb_metrics_file = "outputs/toy-smoke/train/eval-metrics.json"
+wandb_metrics_log_every = 1
 
 [build_cache]
 prompts = "data/prompts/sample_prompts.txt"
@@ -96,7 +96,7 @@ sample_height = 64
 # sample_output_dir = "outputs/toy-smoke/train/train-samples"
 sample_decode_images = false
 sample_image_prefix = "toy-train-sample"
-sample_tracker_log_images = false
+sample_wandb_log_images = false
 dry_run = false
 
 [sample_xpred]
@@ -111,4 +111,4 @@ eps_floor = 1e-4
 decode_sample_images = false
 sample_image_dir = "outputs/toy-smoke/train/sample-images"
 sample_image_prefix = "toy-sample"
-tracker_log_sample_images = false
+wandb_log_sample_images = false

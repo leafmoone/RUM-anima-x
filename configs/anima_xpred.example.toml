@@ -101,34 +101,34 @@ fp8_scaled = false
 # true 时 text encoder 保留在 CPU，显存压力小但更慢。
 text_encoder_cpu = false
 
-[tracker]
+[wandb]
 # 默认关闭。打开后会记录 train/loss、train/grad_norm、train/lr 和有效 batch size。
-tracker_enabled = false
+wandb_enabled = false
 
 # 可选实验追踪设置，默认关闭。
-tracker_project = "rum-anima-xpred-jlt"
-tracker_entity = ""
-tracker_run_name = "anima-xpred-rum"
+wandb_project = "rum-anima-xpred-jlt"
+wandb_entity = ""
+wandb_run_name = "anima-xpred-rum"
 
 # 固定 run id 后，分 chunk 运行可继续写入同一个实验记录。
 # 第一次使用某个 id 时会创建 run；之后 resume="allow" 会继续写入同一个 run。
-tracker_run_id = "anima-xpred-rum-jlt-20260703"
-tracker_resume = "allow"
+wandb_run_id = "anima-xpred-rum-jlt-20260703"
+wandb_resume = "allow"
 
-tracker_mode = ""
-tracker_tags = ["anima", "rum", "xpred"]
-tracker_notes = "Anima latent x-pred RUM reflow experiment."
+wandb_mode = ""
+wandb_tags = ["anima", "rum", "xpred"]
+wandb_notes = "Anima latent x-pred RUM reflow experiment."
 
 # true 时把当前 config/参数写入实验记录。
-tracker_log_config = true
+wandb_log_config = true
 
 # 可选：本地评估脚本写出的 JSON。训练循环会读取其中的 fid/is。
 # 示例 JSON: {"fid": 12.3, "is": 5.6}
 # 当前项目训练本身只处理 latent，不会凭空计算 FID/IS。
-# tracker_metrics_file = "./anima-xpred-train/eval-metrics.json"
+# wandb_metrics_file = "./anima-xpred-train/eval-metrics.json"
 
 # 每隔多少 optimizer step 读取一次 metrics file；0 表示不读取指标。
-tracker_metrics_log_every = 0
+wandb_metrics_log_every = 0
 
 [build_cache]
 # prompt 文件，一行一个 prompt。cache 阶段只保存 latent 和 text conditioning。
@@ -345,7 +345,7 @@ sample_eps_floor = 1e-4
 # true 时训练中 sample 会用 VAE decode PNG。
 sample_decode_images = true
 sample_image_prefix = "xpred-train-sample"
-sample_tracker_log_images = false
+sample_wandb_log_images = false
 
 # 普通训练 sample 的 LoRA 分支；"__inherit__" 表示继承 [build_cache].teacher_lora。
 # 会额外保存/上传一组 sample-lora 图，用来检查加速 LoRA 对当前 x-pred student 的影响。
@@ -379,7 +379,7 @@ sample_compare_eps_floor = 1e-4
 # 只会在本次进程第一次训练中 compare 时导入一次。
 sample_compare_baseline_source_dir = "./compare-baseline"
 sample_compare_baseline_output_dir = "./compare-baseline"
-sample_compare_baseline_tracker_log_images = false
+sample_compare_baseline_wandb_log_images = false
 
 # 训练中 compare 的 LoRA 分支；"__inherit__" 表示继承 [build_cache].teacher_lora。
 # 设为 "" 可只生成 fm/x 两张，不生成 fm_lora/x_lora。
@@ -397,7 +397,7 @@ sample_compare_teacher_sanity_lora_weight = 1.0
 # sample_compare_output_dir = "./anima-xpred-train/train-compare-samples"
 sample_compare_decode_images = true
 sample_compare_image_prefix = "compare-train"
-sample_compare_tracker_log_images = false
+sample_compare_wandb_log_images = false
 
 # true 时只跑一个 optimizer step、打印统计，不保存 checkpoint。
 dry_run = false
@@ -435,7 +435,7 @@ sample_image_dir = "./anima-xpred-train/sample-images"
 sample_image_prefix = "xpred-sample"
 
 # decode_sample_images=true 时，将 PNG 保存到本地 sample image 目录。
-tracker_log_sample_images = false
+wandb_log_sample_images = false
 
 [sample_compare]
 # Debug 对比采样：alpha=0 是 teacher/FM velocity，alpha=1 是 student x-pred 转 velocity。
@@ -453,4 +453,4 @@ alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
 teacher_cfg = 1.0
 decode_sample_images = true
 sample_image_prefix = "compare"
-tracker_log_sample_images = false
+wandb_log_sample_images = false

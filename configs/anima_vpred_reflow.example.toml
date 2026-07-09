@@ -21,14 +21,14 @@ fp8_scaled = false
 text_encoder_cpu = false
 vae_disable_cache = false
 
-[tracker]
-tracker_enabled = false
-tracker_project = "rum-anima-vpred"
-tracker_run_name = "anima-vpred-reflow"
-tracker_mode = "offline"
-tracker_tags = ["anima", "rum", "vpred"]
-tracker_log_config = true
-tracker_metrics_log_every = 0
+[wandb]
+wandb_enabled = false
+wandb_project = "rum-anima-vpred"
+wandb_run_name = "anima-vpred-reflow"
+wandb_mode = "offline"
+wandb_tags = ["anima", "rum", "vpred"]
+wandb_log_config = true
+wandb_metrics_log_every = 0
 
 [build_cache]
 # v-pred reflow 使用同样的 cache：eps_latent + x_teacher_latent + text conditioning。
@@ -82,7 +82,7 @@ sample_eps_floor = 1e-4
 # sample_output_dir = "./anima-vpred-reflow-train/train-samples"
 sample_decode_images = false
 sample_image_prefix = "vpred-train-sample"
-sample_tracker_log_images = false
+sample_wandb_log_images = false
 dry_run = false
 
 [sample_xpred]
@@ -99,4 +99,4 @@ eps_floor = 1e-4
 decode_sample_images = true
 sample_image_dir = "./anima-vpred-reflow-train/sample-images"
 sample_image_prefix = "vpred-sample"
-tracker_log_sample_images = false
+wandb_log_sample_images = false
